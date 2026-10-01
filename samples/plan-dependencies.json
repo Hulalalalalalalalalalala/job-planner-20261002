@@ -1,0 +1,8 @@
+{
+  "jobs": [
+    {"name": "broken-branch", "operation": "shell", "input": "samples/notes.txt"},
+    {"name": "downstream-lines", "operation": "count-lines", "input": "samples/notes.txt", "depends_on": ["broken-branch"]},
+    {"name": "joined-checksum", "operation": "sha256", "input": "samples/notes.txt", "depends_on": ["downstream-lines", "healthy-summary"]},
+    {"name": "healthy-summary", "operation": "csv-summary", "input": "samples/sales.csv"}
+  ]
+}

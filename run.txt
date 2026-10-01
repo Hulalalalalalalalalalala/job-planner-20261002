@@ -6,6 +6,13 @@ Start
 python3 job_planner.py samples/plan.json
 Reports completed 3 and failed 0; saves .results/latest.json.
 
+Dependencies
+python3 job_planner.py samples/plan-dependencies.json --output .results/deps.json
+Reports completed 1, failed 1 and blocked 2 (exit 1): the failing branch blocks
+its downstream chain while the independent CSV summary still succeeds; forward
+references run in the earliest-ready plan order.
+
 Smoke Test
 python3 -B -m unittest -v
-Checks real file operations, recorded errors, directory boundaries and the CLI.
+Checks real file operations, recorded errors, directory boundaries, symlinks,
+dependency validation/blocking and the CLI.

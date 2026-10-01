@@ -33,21 +33,77 @@ def execute_job(root, job):
     return {"columns": rows[0], "rows": len(rows) - 1}
 
 
+def _validate_dependencies(jobs):
+    """Validate depends_on fields and return {name: [dependency names]}.
+
+    References are matched exactly against plan job names and may point
+    forward; cycles are rejected before anything runs.
+    """
+    names = {job["name"] for job in jobs}
+    deps_by_name = {}
+    for job in jobs:
+        name = job["name"]
+        deps = job.get("depends_on", [])
+        if not isinstance(deps, list):
+            raise ValueError(f"job {name!r}: depends_on must be a list")
+        if any(not isinstance(dep, str) or not dep.strip() for dep in deps):
+            raise ValueError(f"job {name!r}: depends_on entries must be nonblank strings")
+        if len(set(deps)) != len(deps):
+            raise ValueError(f"job {name!r}: depends_on contains a duplicate")
+        if name in deps:
+            raise ValueError(f"job {name!r} cannot depend on itself")
+        unknown = [dep for dep in deps if dep not in names]
+        if unknown:
+            raise ValueError(f"job {name!r}: unknown dependency {unknown[0]!r}")
+        deps_by_name[name] = list(deps)
+
+    state = {}
+
+    def visit(node):
+        if state.get(node) == 1:
+            raise ValueError("dependency cycle detected")
+        if state.get(node) == 2:
+            return
+        state[node] = 1
+        for dep in deps_by_name[node]:
+            visit(dep)
+        state[node] = 2
+
+    for name in deps_by_name:
+        visit(name)
+    return deps_by_name
+
+
 def run_plan(root, jobs, output):
     if not isinstance(jobs, list) or not jobs:
         raise ValueError("plan requires at least one job")
     names = [job["name"] for job in jobs]
     if any(not isinstance(name, str) or not name.strip() for name in names) or len(set(names)) != len(names):
         raise ValueError("job names must be nonempty and unique")
+    deps_by_name = _validate_dependencies(jobs)
     report_path = local_path(root, output)
     if any(report_path == local_path(root, job["input"]) for job in jobs):
         raise ValueError("report cannot overwrite a task input")
     results = []
-    for job in jobs:
-        try:
-            result = {"name": job["name"], "status": "completed", "result": execute_job(root, job)}
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            result = {"name": job["name"], "status": "failed", "error": str(exc)}
+    records = {}
+    pending = set(names)
+    while pending:
+        ready = [i for i, job in enumerate(jobs)
+                 if job["name"] in pending
+                 and all(dep in records for dep in deps_by_name[job["name"]])]
+        job = jobs[ready[0]]
+        name = job["name"]
+        pending.discard(name)
+        deps = deps_by_name[name]
+        blocked_by = [dep for dep in deps if records[dep] in ("failed", "blocked")]
+        if blocked_by:
+            result = {"name": name, "status": "blocked", "blocked_by": blocked_by}
+        else:
+            try:
+                result = {"name": name, "status": "completed", "result": execute_job(root, job)}
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                result = {"name": name, "status": "failed", "error": str(exc)}
+        records[name] = result["status"]
         results.append(result)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps({"results": results}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -66,8 +122,12 @@ def main():
             raise ValueError("report cannot overwrite its plan")
         jobs = json.loads(plan.read_text(encoding="utf-8"))["jobs"]
         results = run_plan(args.root, jobs, args.output)
-        print(json.dumps({"completed": sum(row["status"] == "completed" for row in results), "failed": sum(row["status"] == "failed" for row in results)}))
-        return 1 if any(row["status"] == "failed" for row in results) else 0
+        summary = {"completed": sum(row["status"] == "completed" for row in results),
+                   "failed": sum(row["status"] == "failed" for row in results)}
+        if any(job.get("depends_on") for job in jobs):
+            summary["blocked"] = sum(row["status"] == "blocked" for row in results)
+        print(json.dumps(summary))
+        return 1 if any(row["status"] in ("failed", "blocked") for row in results) else 0
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print(json.dumps({"error": str(exc)}))
         return 2
