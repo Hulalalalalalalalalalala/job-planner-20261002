@@ -4,7 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from job_planner import execute_job, local_path, run_plan
+from job_planner import execute_job, local_path, preview_plan, run_plan
 
 ROOT = Path(__file__).resolve().parent
 
@@ -267,6 +267,215 @@ class JobPlannerTests(unittest.TestCase):
             self.assertEqual(run.returncode, 2, run.stderr)
             self.assertIn("error", json.loads(run.stdout))
         self.assertEqual((self.root / ".results/latest.json").read_text(), before)
+
+    def test_preview_without_targets_lists_all_jobs_with_reason_all(self):
+        jobs = [
+            {"name": "final", "operation": "sha256", "input": "notes.txt", "depends_on": ["mid", "indirect"]},
+            {"name": "mid", "operation": "count-lines", "input": "notes.txt", "depends_on": ["base"]},
+            {"name": "indirect", "operation": "count-lines", "input": "sales.csv", "depends_on": ["base"]},
+            {"name": "base", "operation": "sha256", "input": "notes.txt"},
+        ]
+        preview = preview_plan(self.root, jobs, "results/report.json")
+        self.assertEqual([job["name"] for job in preview["jobs"]],
+                         ["base", "mid", "indirect", "final"])
+        by_name = {job["name"]: job for job in preview["jobs"]}
+        self.assertEqual(by_name["base"],
+                         {"name": "base", "depends_on": [], "reason": "all", "required_by": []})
+        self.assertEqual(by_name["mid"]["depends_on"], ["base"])
+        self.assertEqual(by_name["final"]["depends_on"], ["mid", "indirect"])
+        self.assertTrue(all(job["reason"] == "all" for job in preview["jobs"]))
+        self.assertTrue(all(job["required_by"] == [] for job in preview["jobs"]))
+        for job in preview["jobs"]:
+            self.assertEqual(set(job), {"name", "depends_on", "reason", "required_by"})
+
+    def test_preview_target_shows_prerequisites_with_required_by(self):
+        jobs = [
+            {"name": "final", "operation": "sha256", "input": "notes.txt", "depends_on": ["mid", "indirect"]},
+            {"name": "mid", "operation": "count-lines", "input": "notes.txt", "depends_on": ["base"]},
+            {"name": "indirect", "operation": "count-lines", "input": "sales.csv", "depends_on": ["base"]},
+            {"name": "base", "operation": "sha256", "input": "notes.txt"},
+            {"name": "unrelated", "operation": "shell", "input": "missing.txt"},
+        ]
+        preview = preview_plan(self.root, jobs, "results/report.json", targets=["final"])
+        names = [job["name"] for job in preview["jobs"]]
+        self.assertEqual(names, ["base", "mid", "indirect", "final"])
+        by_name = {job["name"]: job for job in preview["jobs"]}
+        self.assertEqual(by_name["base"]["reason"], "prerequisite")
+        self.assertEqual(by_name["mid"]["reason"], "prerequisite")
+        self.assertEqual(by_name["indirect"]["reason"], "prerequisite")
+        self.assertEqual(by_name["final"]["reason"], "target")
+        for name in names:
+            self.assertEqual(by_name[name]["required_by"], ["final"])
+        self.assertFalse((self.root / "results").exists())
+
+    def test_preview_shared_prerequisite_appears_once_and_target_order_invariant(self):
+        jobs = [
+            {"name": "left", "operation": "count-lines", "input": "notes.txt", "depends_on": ["base"]},
+            {"name": "right", "operation": "sha256", "input": "notes.txt", "depends_on": ["base"]},
+            {"name": "base", "operation": "sha256", "input": "sales.csv"},
+            {"name": "other", "operation": "count-lines", "input": "notes.txt"},
+        ]
+        first = preview_plan(self.root, jobs, "results/report.json", targets=["left", "right"])
+        swapped = preview_plan(self.root, jobs, "results/report.json", targets=["right", "left"])
+        self.assertEqual(first, swapped)
+        self.assertEqual([job["name"] for job in first["jobs"]], ["base", "left", "right"])
+        by_name = {job["name"]: job for job in first["jobs"]}
+        self.assertEqual(by_name["base"]["required_by"], ["left", "right"])
+        self.assertTrue(all(job["reason"] == "target" for job in first["jobs"]
+                            if job["name"] in ("left", "right")))
+        self.assertEqual(by_name["base"]["reason"], "prerequisite")
+        self.assertNotIn("other", by_name)
+
+    def test_preview_explicit_target_keeps_target_reason_even_as_prerequisite(self):
+        jobs = [
+            {"name": "a", "operation": "count-lines", "input": "notes.txt", "depends_on": ["b"]},
+            {"name": "b", "operation": "count-lines", "input": "notes.txt"},
+        ]
+        preview = preview_plan(self.root, jobs, "results/report.json", targets=["a", "b"])
+        by_name = {job["name"]: job for job in preview["jobs"]}
+        self.assertEqual([job["name"] for job in preview["jobs"]], ["b", "a"])
+        self.assertEqual(by_name["b"]["reason"], "target")
+        self.assertEqual(by_name["a"]["reason"], "target")
+        self.assertEqual(by_name["b"]["required_by"], ["a", "b"])
+        self.assertEqual(by_name["a"]["required_by"], ["a"])
+
+    def test_preview_order_matches_run_order_despite_failures(self):
+        jobs = [
+            {"name": "broken", "operation": "shell", "input": "notes.txt"},
+            {"name": "downstream", "operation": "count-lines", "input": "notes.txt", "depends_on": ["broken"]},
+            {"name": "grandchild", "operation": "sha256", "input": "notes.txt", "depends_on": ["downstream"]},
+            {"name": "joiner", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["broken", "healthy"]},
+            {"name": "healthy", "operation": "count-lines", "input": "notes.txt"},
+        ]
+        preview = preview_plan(self.root, jobs, "results/preview.json")
+        self.assertEqual([job["name"] for job in preview["jobs"]],
+                         ["broken", "downstream", "grandchild", "healthy", "joiner"])
+        result = run_plan(self.root, jobs, "results/report.json")
+        self.assertEqual([job["name"] for job in preview["jobs"]],
+                         [row["name"] for row in result])
+
+    def test_preview_ignores_missing_inputs_bad_operations_and_bad_contents(self):
+        jobs = [
+            {"name": "gone", "operation": "sha256", "input": "missing.txt"},
+            {"name": "strange", "operation": "shell", "input": "notes.txt"},
+            {"name": "notcsv", "operation": "csv-summary", "input": "notes.txt"},
+        ]
+        preview = preview_plan(self.root, jobs, "nested/dir/report.json")
+        self.assertEqual([job["name"] for job in preview["jobs"]], ["gone", "strange", "notcsv"])
+        self.assertFalse((self.root / "nested").exists())
+        self.assertFalse((self.root / ".results").exists())
+
+    def test_preview_never_reads_or_changes_existing_report(self):
+        report = self.root / "results/report.json"
+        report.parent.mkdir(parents=True)
+        marker = "not json at all"
+        report.write_text(marker, encoding="utf-8")
+        jobs = [
+            {"name": "final", "operation": "shell", "input": "missing.txt", "depends_on": ["base"]},
+            {"name": "base", "operation": "count-lines", "input": "missing.txt"},
+        ]
+        preview = preview_plan(self.root, jobs, "results/report.json", targets=["final"])
+        self.assertEqual([job["name"] for job in preview["jobs"]], ["base", "final"])
+        self.assertEqual(report.read_text(), marker)
+
+    def test_preview_validates_whole_plan_including_unselected_branches(self):
+        jobs = [
+            {"name": "wanted", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "stray", "operation": "count-lines", "input": "../outside.txt"},
+        ]
+        with self.assertRaises(ValueError):
+            preview_plan(self.root, jobs, "results/report.json", targets=["wanted"])
+        bad_deps = [
+            {"name": "wanted", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "stray", "operation": "count-lines", "input": "notes.txt", "depends_on": ["ghost"]},
+        ]
+        with self.assertRaises(ValueError):
+            preview_plan(self.root, bad_deps, "results/report.json", targets=["wanted"])
+        bad_names = [
+            {"name": "wanted", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "wanted", "operation": "count-lines", "input": "notes.txt"},
+        ]
+        with self.assertRaises(ValueError):
+            preview_plan(self.root, bad_names, "results/report.json", targets=["wanted"])
+        cyclic = [
+            {"name": "a", "operation": "count-lines", "input": "notes.txt", "depends_on": ["b"]},
+            {"name": "b", "operation": "count-lines", "input": "notes.txt", "depends_on": ["a"]},
+        ]
+        with self.assertRaises(ValueError):
+            preview_plan(self.root, cyclic, "results/report.json")
+        self.assertFalse((self.root / "results").exists())
+
+    def test_preview_invalid_targets_and_output_paths_raise_value_error(self):
+        jobs = [{"name": "notes", "operation": "count-lines", "input": "notes.txt"}]
+        for targets in ([], "notes", [1], ["  "], ["notes", "notes"], ["ghost"], ["notes", "ghost"]):
+            with self.subTest(targets=targets):
+                with self.assertRaises(ValueError):
+                    preview_plan(self.root, jobs, "results/report.json", targets=targets)
+        with self.assertRaises(ValueError):
+            preview_plan(self.root, jobs, "notes.txt")
+        with self.assertRaises(ValueError):
+            preview_plan(self.root, jobs, "../outside.json")
+        self.assertFalse((self.root / "results").exists())
+
+    def test_cli_preview_flag(self):
+        jobs = [
+            {"name": "final", "operation": "shell", "input": "missing.txt", "depends_on": ["mid", "base"]},
+            {"name": "mid", "operation": "count-lines", "input": "missing.txt", "depends_on": ["base"]},
+            {"name": "base", "operation": "sha256", "input": "missing.txt"},
+            {"name": "other", "operation": "count-lines", "input": "notes.txt"},
+        ]
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json", "--root", str(self.root)]
+        run = subprocess.run(prefix + ["--preview", "--only", "final"], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        expected = preview_plan(self.root, jobs, ".results/latest.json", targets=["final"])
+        self.assertEqual(json.loads(run.stdout), expected)
+        self.assertNotIn("completed", run.stdout)
+        self.assertFalse((self.root / ".results").exists())
+        # Swapping the target order on the command line changes nothing.
+        jobs2 = [
+            {"name": "left", "operation": "count-lines", "input": "notes.txt", "depends_on": ["base"]},
+            {"name": "right", "operation": "count-lines", "input": "notes.txt", "depends_on": ["base"]},
+            {"name": "base", "operation": "sha256", "input": "notes.txt"},
+        ]
+        plan.write_text(json.dumps({"jobs": jobs2}))
+        one = subprocess.run(prefix + ["--preview", "--only", "left", "--only", "right"],
+                             capture_output=True, text=True)
+        two = subprocess.run(prefix + ["--preview", "--only", "right", "--only", "left"],
+                             capture_output=True, text=True)
+        self.assertEqual(one.returncode, 0, one.stderr)
+        self.assertEqual(one.stdout, two.stdout)
+        self.assertEqual(json.loads(one.stdout),
+                         preview_plan(self.root, jobs2, ".results/latest.json", targets=["left", "right"]))
+
+    def test_cli_preview_error_json_exit_2_keeps_report_and_plan(self):
+        report = self.root / ".results/latest.json"
+        report.parent.mkdir(parents=True)
+        report.write_text('{"results": [{"name": "kept"}]}', encoding="utf-8")
+        plan = self.root / "plan.json"
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json", "--root", str(self.root)]
+        # Unknown target: error JSON, exit 2, report untouched, nothing executed.
+        plan.write_text(json.dumps({"jobs": [
+            {"name": "notes", "operation": "count-lines", "input": "notes.txt"}]}))
+        run = subprocess.run(prefix + ["--preview", "--only", "ghost"], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertIn("error", json.loads(run.stdout))
+        self.assertEqual(report.read_text(), '{"results": [{"name": "kept"}]}')
+        # The CLI also protects the plan file in preview mode.
+        run = subprocess.run(prefix + ["--preview", "--output", "plan.json"], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertIn("error", json.loads(run.stdout))
+        self.assertEqual(plan.read_text(), json.dumps({"jobs": [
+            {"name": "notes", "operation": "count-lines", "input": "notes.txt"}]}))
+        # A bad dependency anywhere in the plan rejects the preview as well.
+        plan.write_text(json.dumps({"jobs": [
+            {"name": "a", "operation": "count-lines", "input": "notes.txt", "depends_on": ["x"]}]}))
+        run = subprocess.run(prefix + ["--preview"], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertIn("error", json.loads(run.stdout))
+        self.assertEqual(report.read_text(), '{"results": [{"name": "kept"}]}')
 
     def test_cli_summary_without_dependencies_keeps_fields(self):
         jobs = [
