@@ -74,7 +74,42 @@ def _validate_dependencies(jobs):
     return deps_by_name
 
 
-def run_plan(root, jobs, output):
+def _resolve_scope(names, deps_by_name, targets):
+    """Validate targets and return the set of jobs to run.
+
+    None means the whole plan. Otherwise targets must be a nonempty list of
+    exact, unique, known job names; the scope adds every direct and indirect
+    prerequisite, each counted once.
+    """
+    if targets is None:
+        return set(names)
+    if not isinstance(targets, list):
+        raise ValueError("targets must be a list of task names")
+    if not targets:
+        raise ValueError("targets must not be empty")
+    known = set(names)
+    seen = set()
+    for target in targets:
+        if not isinstance(target, str):
+            raise ValueError("targets entries must be strings")
+        if not target.strip():
+            raise ValueError("targets entries must not be blank")
+        if target in seen:
+            raise ValueError(f"target {target!r} is repeated")
+        if target not in known:
+            raise ValueError(f"unknown target {target!r}")
+        seen.add(target)
+    scope = set()
+    stack = list(targets)
+    while stack:
+        name = stack.pop()
+        if name not in scope:
+            scope.add(name)
+            stack.extend(deps_by_name[name])
+    return scope
+
+
+def run_plan(root, jobs, output, targets=None):
     if not isinstance(jobs, list) or not jobs:
         raise ValueError("plan requires at least one job")
     names = [job["name"] for job in jobs]
@@ -82,11 +117,14 @@ def run_plan(root, jobs, output):
         raise ValueError("job names must be nonempty and unique")
     deps_by_name = _validate_dependencies(jobs)
     report_path = local_path(root, output)
-    if any(report_path == local_path(root, job["input"]) for job in jobs):
+    # The whole plan is checked, including jobs the run scope will skip.
+    input_paths = [local_path(root, job["input"]) for job in jobs]
+    if any(report_path == path for path in input_paths):
         raise ValueError("report cannot overwrite a task input")
+    scope = _resolve_scope(names, deps_by_name, targets)
     results = []
     records = {}
-    pending = set(names)
+    pending = set(scope)
     while pending:
         ready = [i for i, job in enumerate(jobs)
                  if job["name"] in pending
@@ -115,16 +153,19 @@ def main():
     parser.add_argument("plan")
     parser.add_argument("--root", default=".")
     parser.add_argument("--output", default=".results/latest.json")
+    parser.add_argument("--only", action="append", default=None, metavar="TASK",
+                        help="run only TASK and its prerequisites; repeat to select several")
     args = parser.parse_args()
     try:
         plan = local_path(args.root, args.plan)
         if plan == local_path(args.root, args.output):
             raise ValueError("report cannot overwrite its plan")
         jobs = json.loads(plan.read_text(encoding="utf-8"))["jobs"]
-        results = run_plan(args.root, jobs, args.output)
+        results = run_plan(args.root, jobs, args.output, targets=args.only)
         summary = {"completed": sum(row["status"] == "completed" for row in results),
                    "failed": sum(row["status"] == "failed" for row in results)}
-        if any(job.get("depends_on") for job in jobs):
+        run_names = {row["name"] for row in results}
+        if any(job.get("depends_on") for job in jobs if job["name"] in run_names):
             summary["blocked"] = sum(row["status"] == "blocked" for row in results)
         print(json.dumps(summary))
         return 1 if any(row["status"] in ("failed", "blocked") for row in results) else 0

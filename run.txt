@@ -12,6 +12,13 @@ Reports completed 1, failed 1 and blocked 2 (exit 1): the failing branch blocks
 its downstream chain while the independent CSV summary still succeeds; forward
 references run in the earliest-ready plan order.
 
+Targeted Run
+python3 job_planner.py samples/plan-dependencies.json --output .results/only.json \
+  --only joined-checksum
+Runs the named task and every prerequisite, nothing else. Repeat --only to pick
+several targets; shared prerequisites run once. Invalid or unknown names print
+{"error": ...} and return 2 without touching the existing report.
+
 Smoke Test
 python3 -B -m unittest -v
 Checks real file operations, recorded errors, directory boundaries, symlinks,
