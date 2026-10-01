@@ -1,0 +1,1 @@
+{"jobs":[{"name":"note-lines","operation":"count-lines","input":"samples/notes.txt"},{"name":"note-checksum","operation":"sha256","input":"samples/notes.txt"},{"name":"sales-summary","operation":"csv-summary","input":"samples/sales.csv"}]}

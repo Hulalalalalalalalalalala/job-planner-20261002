@@ -1,0 +1,11 @@
+Install
+python3 --version
+Python 3.10 or newer; no third-party dependencies.
+
+Start
+python3 job_planner.py samples/plan.json
+Reports completed 3 and failed 0; saves .results/latest.json.
+
+Smoke Test
+python3 -B -m unittest -v
+Checks real file operations, recorded errors, directory boundaries and the CLI.
