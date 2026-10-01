@@ -74,7 +74,35 @@ def _validate_dependencies(jobs):
     return deps_by_name
 
 
-def run_plan(root, jobs, output):
+def _select_jobs(jobs, targets):
+    """Return the plan-ordered sublist for targets plus all their prerequisites.
+
+    Targets match job names exactly; the whole plan must already be validated.
+    """
+    if targets is None:
+        return list(jobs)
+    if not isinstance(targets, list) or not targets:
+        raise ValueError("targets must be a nonempty list of job names")
+    if any(not isinstance(target, str) or not target.strip() for target in targets):
+        raise ValueError("targets must be nonblank strings")
+    if len(set(targets)) != len(targets):
+        raise ValueError("targets contain a duplicate")
+    names = {job["name"] for job in jobs}
+    unknown = [target for target in targets if target not in names]
+    if unknown:
+        raise ValueError(f"unknown target {unknown[0]!r}")
+    deps_by_name = {job["name"]: job.get("depends_on", []) for job in jobs}
+    keep = set()
+    stack = list(targets)
+    while stack:
+        name = stack.pop()
+        if name not in keep:
+            keep.add(name)
+            stack.extend(deps_by_name[name])
+    return [job for job in jobs if job["name"] in keep]
+
+
+def run_plan(root, jobs, output, targets=None):
     if not isinstance(jobs, list) or not jobs:
         raise ValueError("plan requires at least one job")
     names = [job["name"] for job in jobs]
@@ -84,14 +112,15 @@ def run_plan(root, jobs, output):
     report_path = local_path(root, output)
     if any(report_path == local_path(root, job["input"]) for job in jobs):
         raise ValueError("report cannot overwrite a task input")
+    selected = _select_jobs(jobs, targets)
     results = []
     records = {}
-    pending = set(names)
+    pending = {job["name"] for job in selected}
     while pending:
-        ready = [i for i, job in enumerate(jobs)
+        ready = [i for i, job in enumerate(selected)
                  if job["name"] in pending
                  and all(dep in records for dep in deps_by_name[job["name"]])]
-        job = jobs[ready[0]]
+        job = selected[ready[0]]
         name = job["name"]
         pending.discard(name)
         deps = deps_by_name[name]
@@ -115,16 +144,18 @@ def main():
     parser.add_argument("plan")
     parser.add_argument("--root", default=".")
     parser.add_argument("--output", default=".results/latest.json")
+    parser.add_argument("--only", action="append", default=None, metavar="NAME",
+                        help="run only this job and its prerequisites (repeatable)")
     args = parser.parse_args()
     try:
         plan = local_path(args.root, args.plan)
         if plan == local_path(args.root, args.output):
             raise ValueError("report cannot overwrite its plan")
         jobs = json.loads(plan.read_text(encoding="utf-8"))["jobs"]
-        results = run_plan(args.root, jobs, args.output)
+        results = run_plan(args.root, jobs, args.output, targets=args.only)
         summary = {"completed": sum(row["status"] == "completed" for row in results),
                    "failed": sum(row["status"] == "failed" for row in results)}
-        if any(job.get("depends_on") for job in jobs):
+        if any(job.get("depends_on") for job in _select_jobs(jobs, args.only)):
             summary["blocked"] = sum(row["status"] == "blocked" for row in results)
         print(json.dumps(summary))
         return 1 if any(row["status"] in ("failed", "blocked") for row in results) else 0

@@ -167,6 +167,107 @@ class JobPlannerTests(unittest.TestCase):
         self.assertIn("error", json.loads(run.stdout))
         self.assertFalse((self.root / "results/other.json").exists())
 
+    def test_targets_run_only_selection_and_prerequisites(self):
+        jobs = [
+            {"name": "final", "operation": "sha256", "input": "notes.txt", "depends_on": ["mid", "indirect"]},
+            {"name": "mid", "operation": "count-lines", "input": "notes.txt", "depends_on": ["base"]},
+            {"name": "indirect", "operation": "count-lines", "input": "sales.csv", "depends_on": ["base"]},
+            {"name": "base", "operation": "sha256", "input": "notes.txt"},
+            {"name": "unrelated", "operation": "shell", "input": "missing.txt"},
+        ]
+        result = run_plan(self.root, jobs, "results/report.json", targets=["final"])
+        self.assertEqual([row["name"] for row in result], ["base", "mid", "indirect", "final"])
+        self.assertTrue(all(row["status"] == "completed" for row in result))
+        report = json.loads((self.root / "results/report.json").read_text())["results"]
+        self.assertEqual(report, result)
+        # None keeps the full-plan behavior, including the unrelated failure.
+        full = run_plan(self.root, jobs, "results/report.json")
+        self.assertEqual([row["name"] for row in full],
+                         ["base", "mid", "indirect", "final", "unrelated"])
+        self.assertEqual(full[-1]["status"], "failed")
+
+    def test_targets_share_prerequisites_and_ignore_declaration_order(self):
+        jobs = [
+            {"name": "left", "operation": "count-lines", "input": "notes.txt", "depends_on": ["base"]},
+            {"name": "right", "operation": "sha256", "input": "notes.txt", "depends_on": ["base"]},
+            {"name": "base", "operation": "sha256", "input": "sales.csv"},
+            {"name": "other", "operation": "count-lines", "input": "notes.txt"},
+        ]
+        for targets in (["left", "right"], ["right", "left"]):
+            result = run_plan(self.root, jobs, "results/report.json", targets=targets)
+            self.assertEqual([row["name"] for row in result], ["base", "left", "right"])
+
+    def test_failed_shared_prerequisite_blocks_one_target_only(self):
+        jobs = [
+            {"name": "broken", "operation": "shell", "input": "notes.txt"},
+            {"name": "needy", "operation": "count-lines", "input": "notes.txt", "depends_on": ["broken"]},
+            {"name": "free", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "unrelated", "operation": "count-lines", "input": "notes.txt"},
+        ]
+        result = run_plan(self.root, jobs, "results/report.json", targets=["needy", "free"])
+        self.assertEqual([row["name"] for row in result], ["broken", "needy", "free"])
+        self.assertEqual([row["status"] for row in result], ["failed", "blocked", "completed"])
+        self.assertEqual(result[1], {"name": "needy", "status": "blocked", "blocked_by": ["broken"]})
+
+    def test_invalid_targets_raise_value_error_and_keep_report(self):
+        jobs = [{"name": "notes", "operation": "count-lines", "input": "notes.txt"}]
+        report = self.root / "results/report.json"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        marker = '{"results": [{"name": "kept"}]}'
+        report.write_text(marker, encoding="utf-8")
+        for targets in ([], "notes", [1], ["  "], ["notes", "notes"], ["ghost"], ["notes", "ghost"]):
+            with self.subTest(targets=targets):
+                with self.assertRaises(ValueError):
+                    run_plan(self.root, jobs, "results/report.json", targets=targets)
+        self.assertEqual(report.read_text(), marker)
+
+    def test_unselected_branch_still_validated(self):
+        jobs = [
+            {"name": "wanted", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "stray", "operation": "count-lines", "input": "../outside.txt"},
+        ]
+        with self.assertRaises(ValueError):
+            run_plan(self.root, jobs, "results/report.json", targets=["wanted"])
+        bad_deps = [
+            {"name": "wanted", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "stray", "operation": "count-lines", "input": "notes.txt", "depends_on": ["ghost"]},
+        ]
+        with self.assertRaises(ValueError):
+            run_plan(self.root, bad_deps, "results/report.json", targets=["wanted"])
+        self.assertFalse((self.root / "results/report.json").exists())
+
+    def test_cli_only_flag(self):
+        jobs = [
+            {"name": "broken", "operation": "shell", "input": "notes.txt"},
+            {"name": "downstream", "operation": "count-lines", "input": "notes.txt", "depends_on": ["broken"]},
+            {"name": "healthy", "operation": "count-lines", "input": "notes.txt"},
+        ]
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json", "--root", str(self.root)]
+        # Selecting only the healthy job skips the failing branch entirely.
+        run = subprocess.run(prefix + ["--only", "healthy"], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), {"completed": 1, "failed": 0})
+        report = json.loads((self.root / ".results/latest.json").read_text())["results"]
+        self.assertEqual([row["name"] for row in report], ["healthy"])
+        # Selecting the dependent pulls in its failing prerequisite and reports blocked.
+        run = subprocess.run(prefix + ["--only", "downstream"], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertEqual(json.loads(run.stdout), {"completed": 0, "failed": 1, "blocked": 1})
+        # Repeated --only selects several targets.
+        run = subprocess.run(prefix + ["--only", "downstream", "--only", "healthy"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertEqual(json.loads(run.stdout), {"completed": 1, "failed": 1, "blocked": 1})
+        # An unknown or repeated target returns 2 with error JSON and keeps the old report.
+        before = (self.root / ".results/latest.json").read_text()
+        for extra in (["--only", "ghost"], ["--only", "healthy", "--only", "healthy"], ["--only", " "]):
+            run = subprocess.run(prefix + extra, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            self.assertIn("error", json.loads(run.stdout))
+        self.assertEqual((self.root / ".results/latest.json").read_text(), before)
+
     def test_cli_summary_without_dependencies_keeps_fields(self):
         jobs = [
             {"name": "broken", "operation": "shell", "input": "notes.txt"},
