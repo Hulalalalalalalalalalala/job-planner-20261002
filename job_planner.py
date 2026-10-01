@@ -102,7 +102,13 @@ def _select_jobs(jobs, targets):
     return [job for job in jobs if job["name"] in keep]
 
 
-def run_plan(root, jobs, output, targets=None):
+def _validate_plan(root, jobs, output):
+    """Validate names, dependencies and all paths; return deps map and report path.
+
+    The whole plan is checked, including unselected branches, before any
+    scope is chosen. Inputs are resolved for boundary checks but never read;
+    nothing is created.
+    """
     if not isinstance(jobs, list) or not jobs:
         raise ValueError("plan requires at least one job")
     names = [job["name"] for job in jobs]
@@ -112,6 +118,72 @@ def run_plan(root, jobs, output, targets=None):
     report_path = local_path(root, output)
     if any(report_path == local_path(root, job["input"]) for job in jobs):
         raise ValueError("report cannot overwrite a task input")
+    return deps_by_name, report_path
+
+
+def _run_order(selected, deps_by_name):
+    """Return selected job names in the earliest-ready processing order.
+
+    Each pass emits the earliest-in-plan pending job whose direct
+    dependencies were already emitted; the validated acyclic graph and the
+    full prerequisite closure guarantee this matches an actual run.
+    """
+    pending = {job["name"] for job in selected}
+    ordered = []
+    while pending:
+        ready = [job for job in selected
+                 if job["name"] in pending
+                 and all(dep not in pending for dep in deps_by_name[job["name"]])]
+        name = ready[0]["name"]
+        pending.discard(name)
+        ordered.append(name)
+    return ordered
+
+
+def preview_plan(root, jobs, output, targets=None):
+    """Describe what run_plan would do, without executing or touching files.
+
+    Validates the whole plan exactly like a run, then returns
+    ``{"jobs": [...]}`` covering the targets and every prerequisite, each
+    once, in run processing order. Jobs carry name, depends_on (declaration
+    order, [] when absent), reason ("all" without targets, otherwise
+    "target"/"prerequisite") and required_by (explicit targets needing the
+    job, in original plan order). Inputs are never read and no report is
+    written, so missing files, unknown operations and bad file contents do
+    not fail a preview; validation failures still raise ValueError.
+    """
+    deps_by_name, _report_path = _validate_plan(root, jobs, output)
+    selected = _select_jobs(jobs, targets)
+    ordered = _run_order(selected, deps_by_name)
+    explicit = set(targets) if targets is not None else set()
+    required_by = {name: [] for name in ordered}
+    if targets is not None:
+        # Walk explicit targets in original plan order so required_by lists
+        # are independent of the target argument order.
+        for job in selected:
+            target = job["name"]
+            if target not in explicit:
+                continue
+            stack = [target]
+            seen = set()
+            while stack:
+                node = stack.pop()
+                if node in seen:
+                    continue
+                seen.add(node)
+                required_by[node].append(target)
+                stack.extend(deps_by_name[node])
+    return {"jobs": [
+        {"name": name,
+         "depends_on": list(deps_by_name[name]),
+         "reason": "all" if targets is None else ("target" if name in explicit else "prerequisite"),
+         "required_by": required_by[name]}
+        for name in ordered
+    ]}
+
+
+def run_plan(root, jobs, output, targets=None):
+    deps_by_name, report_path = _validate_plan(root, jobs, output)
     selected = _select_jobs(jobs, targets)
     results = []
     records = {}
@@ -146,12 +218,18 @@ def main():
     parser.add_argument("--output", default=".results/latest.json")
     parser.add_argument("--only", action="append", default=None, metavar="NAME",
                         help="run only this job and its prerequisites (repeatable)")
+    parser.add_argument("--preview", action="store_true",
+                        help="print the jobs that would run with reasons, then exit 0")
     args = parser.parse_args()
     try:
         plan = local_path(args.root, args.plan)
         if plan == local_path(args.root, args.output):
             raise ValueError("report cannot overwrite its plan")
         jobs = json.loads(plan.read_text(encoding="utf-8"))["jobs"]
+        if args.preview:
+            print(json.dumps(preview_plan(args.root, jobs, args.output, targets=args.only),
+                             ensure_ascii=False, indent=2))
+            return 0
         results = run_plan(args.root, jobs, args.output, targets=args.only)
         summary = {"completed": sum(row["status"] == "completed" for row in results),
                    "failed": sum(row["status"] == "failed" for row in results)}

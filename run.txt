@@ -17,6 +17,12 @@ python3 job_planner.py samples/plan-dependencies.json --only joined-checksum
 Runs only the named job plus its prerequisites; repeat --only to select several
 targets. Unknown, blank or repeated names exit 2 with an error JSON.
 
+Preview
+python3 job_planner.py samples/plan-dependencies.json --preview --only joined-checksum
+Prints the jobs that would run, in run order, with depends_on, reason
+(target/prerequisite, or all without --only) and required_by; exits 0 and runs
+nothing. The whole plan is still validated; failures exit 2 with an error JSON.
+
 Smoke Test
 python3 -B -m unittest -v
 Checks real file operations, recorded errors, directory boundaries, symlinks,
