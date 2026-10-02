@@ -59,19 +59,28 @@ def _validate_dependencies(jobs):
         deps_by_name[name] = list(deps)
 
     state = {}
-
-    def visit(node):
-        if state.get(node) == 1:
-            raise ValueError("dependency cycle detected")
-        if state.get(node) == 2:
-            return
-        state[node] = 1
-        for dep in deps_by_name[node]:
-            visit(dep)
-        state[node] = 2
-
-    for name in deps_by_name:
-        visit(name)
+    for root in deps_by_name:
+        if root in state:
+            continue
+        state[root] = 1
+        # Iterative three-color DFS: a legal chain may span thousands of
+        # forward-referencing jobs, so the walk cannot depend on Python's
+        # recursion depth. Each frame is (node, index of its next dependency).
+        stack = [(root, 0)]
+        while stack:
+            node, index = stack[-1]
+            deps = deps_by_name[node]
+            if index >= len(deps):
+                state[node] = 2
+                stack.pop()
+                continue
+            dep = deps[index]
+            stack[-1] = (node, index + 1)
+            if state.get(dep) == 1:
+                raise ValueError("dependency cycle detected")
+            if dep not in state:
+                state[dep] = 1
+                stack.append((dep, 0))
     return deps_by_name
 
 
