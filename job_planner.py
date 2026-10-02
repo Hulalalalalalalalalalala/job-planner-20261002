@@ -683,6 +683,39 @@ def _changed_targets(root, jobs, deps_by_name, changed_inputs):
     return hits, [job["name"] for job in jobs if job["name"] in affected]
 
 
+def _change_entries(jobs, deps_by_name, hits, targets):
+    """Preview entries for a change run, with the ``triggered_by`` field added.
+
+    Shared by ``preview_changes`` and the recorded ``execution`` block of
+    ``run_changes`` so both always express the same reasons. ``hits`` are
+    the directly changed tasks and ``targets`` the hits plus every
+    downstream task, both plan-ordered; the entries otherwise match
+    ``preview_plan`` with targets and gain ``triggered_by`` — the directly
+    changed tasks reaching each job along dependency edges, in plan order
+    (``[]`` for jobs included only as prerequisites).
+    """
+    entries = _preview_entries(jobs, deps_by_name, targets)
+    dependents = {name: [] for name in deps_by_name}
+    for name, deps in deps_by_name.items():
+        for dep in deps:
+            dependents[dep].append(name)
+    reachable = {name: set() for name in targets}
+    for hit in hits:
+        seen = set()
+        stack = [hit]
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            reachable[node].add(hit)
+            stack.extend(dependents[node])
+    for entry in entries:
+        entry["triggered_by"] = [hit for hit in hits
+                                 if hit in reachable.get(entry["name"], set())]
+    return entries
+
+
 def preview_changes(root, jobs, output, changed_inputs):
     """Preview the tasks affected by changed input files, without touching files.
 
@@ -714,30 +747,18 @@ def preview_changes(root, jobs, output, changed_inputs):
     hits, targets = _changed_targets(root, jobs, deps_by_name, changed_inputs)
     if not targets:
         return {"targets": [], "jobs": []}
-    entries = _preview_entries(jobs, deps_by_name, targets)
-    # triggered_by: directly changed tasks reaching each target, plan order.
-    dependents = {name: [] for name in deps_by_name}
-    for name, deps in deps_by_name.items():
-        for dep in deps:
-            dependents[dep].append(name)
-    reachable = {name: set() for name in targets}
-    for hit in hits:
-        seen = set()
-        stack = [hit]
-        while stack:
-            node = stack.pop()
-            if node in seen:
-                continue
-            seen.add(node)
-            reachable[node].add(hit)
-            stack.extend(dependents[node])
-    for entry in entries:
-        entry["triggered_by"] = [hit for hit in hits
-                                 if hit in reachable.get(entry["name"], set())]
+    entries = _change_entries(jobs, deps_by_name, hits, targets)
     return {"targets": targets, "jobs": entries}
 
 
-def _run_selected(root, selected, deps_by_name, report_path):
+def _reasons_enabled(record_reasons):
+    """The record_reasons option accepts booleans only; default off."""
+    if not isinstance(record_reasons, bool):
+        raise ValueError("record_reasons must be a boolean")
+    return record_reasons
+
+
+def _run_selected(root, selected, deps_by_name, report_path, reasons=None):
     """Execute an already-selected plan-ordered job list and write its report.
 
     Processing order, failure records and blocked propagation are shared by
@@ -745,6 +766,13 @@ def _run_selected(root, selected, deps_by_name, report_path):
     or blocked direct dependency blocks dependants without reading their
     input, and only this run's results drive dependency decisions. The
     report contains exactly these results, replacing any prior content.
+
+    When ``reasons`` is the planned ``{"mode", "targets", "jobs"}`` block
+    it is recorded under the report's top-level ``execution`` key alongside
+    ``results``; the reasons are fixed before execution, so failed and
+    blocked tasks keep their selected reason and the block is never
+    rewritten from the run's outcomes. The jobs list the results share
+    names and order with, each once.
     """
     results = []
     records = {}
@@ -767,18 +795,41 @@ def _run_selected(root, selected, deps_by_name, report_path):
                 result = {"name": name, "status": "failed", "error": str(exc)}
         records[name] = result["status"]
         results.append(result)
+    report = {"results": results}
+    if reasons is not None:
+        report["execution"] = reasons
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps({"results": results}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return results
 
 
-def run_plan(root, jobs, output, targets=None):
+def run_plan(root, jobs, output, targets=None, record_reasons=False):
+    """Execute the plan (or targets plus prerequisites) and write its report.
+
+    With ``record_reasons`` off (the default) behavior, the returned list
+    and the report are exactly the historical ones. With it on and at
+    least one processed job, the report additionally carries a top-level
+    ``execution`` object with only ``mode`` (``"all"`` without targets,
+    otherwise ``"only"`` even when the targets cover the whole plan),
+    ``targets`` (every plan job for ``all``, else the explicit targets in
+    plan order) and ``jobs`` — the ``preview_plan`` entries for the same
+    targets, same names and order as the returned results. ``record_reasons``
+    must be a boolean; any other type raises ValueError.
+    """
+    _reasons_enabled(record_reasons)
     deps_by_name, report_path = _validate_plan(root, jobs, output)
     selected = _select_jobs(jobs, targets)
-    return _run_selected(root, selected, deps_by_name, report_path)
+    reasons = None
+    if record_reasons and selected:
+        mode = "all" if targets is None else "only"
+        plan_targets = [job["name"] for job in jobs] if targets is None \
+            else [job["name"] for job in jobs if job["name"] in set(targets)]
+        reasons = {"mode": mode, "targets": plan_targets,
+                   "jobs": _preview_entries(jobs, deps_by_name, targets)}
+    return _run_selected(root, selected, deps_by_name, report_path, reasons)
 
 
-def run_retry(root, jobs, output, report):
+def run_retry(root, jobs, output, report, record_reasons=False):
     """Execute a manual retry derived from a historical run report.
 
     Target selection mirrors ``preview_retry``: every task the report
@@ -801,7 +852,18 @@ def run_retry(root, jobs, output, report):
     the output path are validated first; report problems raise ValueError
     exactly as in ``preview_retry``, and creating the output directory or
     writing the report may raise OSError after tasks have run.
+
+    With ``record_reasons`` on and at least one retry target, the report
+    additionally carries the top-level ``execution`` block with
+    ``mode: "retry"``, ``targets`` the failed/blocked tasks in current
+    plan order (taken from the report before any overwrite, so
+    ``report == output`` still records the pre-overwrite reasons) and
+    ``jobs`` the ``preview_retry`` entries for the same targets, sharing
+    names and order with the returned results. With no retry targets no
+    report is written regardless of the option. ``record_reasons`` must
+    be a boolean; any other type raises ValueError.
     """
+    _reasons_enabled(record_reasons)
     deps_by_name, report_path = _validate_plan(root, jobs, output)
     statuses = _read_retry_report(root, report, {job["name"] for job in jobs})
     targets = [job["name"] for job in jobs
@@ -809,10 +871,13 @@ def run_retry(root, jobs, output, report):
     if not targets:
         return []
     selected = _select_jobs(jobs, targets)
-    return _run_selected(root, selected, deps_by_name, report_path)
+    reasons = {"mode": "retry", "targets": targets,
+               "jobs": _preview_entries(jobs, deps_by_name, targets)} \
+        if record_reasons else None
+    return _run_selected(root, selected, deps_by_name, report_path, reasons)
 
 
-def run_changes(root, jobs, output, changed_inputs):
+def run_changes(root, jobs, output, changed_inputs, record_reasons=False):
     """Execute the tasks affected by changed input files.
 
     Target selection mirrors ``preview_changes``: the tasks whose resolved
@@ -844,13 +909,27 @@ def run_changes(root, jobs, output, changed_inputs):
     ValueError before anything runs. Creating the output directory or
     writing the report may raise OSError after tasks have run; executed
     tasks are not undone.
+
+    With ``record_reasons`` on and at least one target, the report
+    additionally carries the top-level ``execution`` block with
+    ``mode: "changes"``, ``targets`` the directly changed tasks plus
+    their downstream tasks in plan order and ``jobs`` exactly the
+    ``preview_changes`` entries (including ``triggered_by``) for the same
+    inputs, sharing names and order with the returned results; duplicate
+    and alias paths change neither targets nor reasons. With no match no
+    report is written regardless of the option. ``record_reasons`` must
+    be a boolean; any other type raises ValueError.
     """
+    _reasons_enabled(record_reasons)
     deps_by_name, report_path = _validate_plan(root, jobs, output)
-    _hits, targets = _changed_targets(root, jobs, deps_by_name, changed_inputs)
+    hits, targets = _changed_targets(root, jobs, deps_by_name, changed_inputs)
     if not targets:
         return []
     selected = _select_jobs(jobs, targets)
-    return _run_selected(root, selected, deps_by_name, report_path)
+    reasons = {"mode": "changes", "targets": targets,
+               "jobs": _change_entries(jobs, deps_by_name, hits, targets)} \
+        if record_reasons else None
+    return _run_selected(root, selected, deps_by_name, report_path, reasons)
 
 
 def main():
@@ -876,8 +955,17 @@ def main():
                         help="preview tasks affected by changed input PATH (repeatable), read-only")
     parser.add_argument("--run-changed", action="append", default=None, metavar="PATH",
                         help="run tasks affected by changed input PATH (repeatable)")
+    parser.add_argument("--record-reasons", action="store_true",
+                        help="record why tasks entered this run in the report's execution block")
     args = parser.parse_args()
     try:
+        if args.record_reasons and (args.preview or args.retry_preview is not None
+                                    or args.compare is not None
+                                    or args.explain is not None
+                                    or args.history is not None
+                                    or args.changed is not None):
+            raise ValueError("--record-reasons cannot be combined with --preview, "
+                             "--retry-preview, --compare, --explain, --history or --changed")
         if args.run_changed is not None and (args.only is not None or args.preview
                                              or args.retry_preview is not None
                                              or args.retry is not None
@@ -952,11 +1040,14 @@ def main():
                              ensure_ascii=False, indent=2))
             return 0
         if args.retry is not None:
-            results = run_retry(args.root, jobs, args.output, args.retry)
+            results = run_retry(args.root, jobs, args.output, args.retry,
+                                record_reasons=args.record_reasons)
         elif args.run_changed is not None:
-            results = run_changes(args.root, jobs, args.output, args.run_changed)
+            results = run_changes(args.root, jobs, args.output, args.run_changed,
+                                  record_reasons=args.record_reasons)
         else:
-            results = run_plan(args.root, jobs, args.output, targets=args.only)
+            results = run_plan(args.root, jobs, args.output, targets=args.only,
+                               record_reasons=args.record_reasons)
         summary = {"completed": sum(row["status"] == "completed" for row in results),
                    "failed": sum(row["status"] == "failed" for row in results)}
         declared_deps = {job["name"]: job.get("depends_on", []) for job in jobs}
