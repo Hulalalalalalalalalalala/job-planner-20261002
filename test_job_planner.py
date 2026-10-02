@@ -5,8 +5,8 @@ import sys
 import tempfile
 import unittest
 from job_planner import (compare_reports, execute_job, explain_report, local_path,
-                         preview_plan, preview_retry, query_history, run_plan,
-                         run_retry)
+                         preview_changes, preview_plan, preview_retry, query_history,
+                         run_plan, run_retry)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -418,6 +418,238 @@ class JobPlannerTests(unittest.TestCase):
                              capture_output=True, text=True)
         self.assertEqual(run.returncode, 2, run.stderr)
         self.assertIn("error", json.loads(run.stdout))
+
+
+    def _changes_jobs(self):
+        return [
+            {"name": "jia", "operation": "count-lines", "input": "a.txt"},
+            {"name": "yi", "operation": "count-lines", "input": "b.txt",
+             "depends_on": ["jia", "bing"]},
+            {"name": "grand", "operation": "sha256", "input": "notes.txt",
+             "depends_on": ["yi"]},
+            {"name": "bing", "operation": "count-lines", "input": "c.txt"},
+            {"name": "other", "operation": "count-lines", "input": "c.txt"},
+        ]
+
+    def test_changes_targets_jobs_and_triggered_by(self):
+        jobs = self._changes_jobs()
+        result = preview_changes(self.root, jobs, "results/report.json", ["a.txt"])
+        self.assertEqual(result["targets"], ["jia", "yi", "grand"])
+        by_name = {row["name"]: row for row in result["jobs"]}
+        self.assertEqual(list(by_name), ["jia", "bing", "yi", "grand"])
+        self.assertTrue(all(set(row) == {"name", "depends_on", "reason",
+                                         "required_by", "triggered_by"}
+                            for row in result["jobs"]))
+        # jia is directly hit; yi is downstream of it; unchanged bing joins
+        # only as yi's prerequisite.
+        self.assertEqual(by_name["jia"],
+                         {"name": "jia", "depends_on": [], "reason": "target",
+                          "required_by": ["jia", "yi", "grand"],
+                          "triggered_by": ["jia"]})
+        self.assertEqual(by_name["yi"],
+                         {"name": "yi", "depends_on": ["jia", "bing"],
+                          "reason": "target", "required_by": ["yi", "grand"],
+                          "triggered_by": ["jia"]})
+        self.assertEqual(by_name["grand"],
+                         {"name": "grand", "depends_on": ["yi"], "reason": "target",
+                          "required_by": ["grand"], "triggered_by": ["jia"]})
+        self.assertEqual(by_name["bing"],
+                         {"name": "bing", "depends_on": [], "reason": "prerequisite",
+                          "required_by": ["yi", "grand"], "triggered_by": []})
+        self.assertNotIn("other", by_name)
+
+    def test_changes_direct_hit_with_own_downstream_triggers_itself(self):
+        jobs = self._changes_jobs()
+        result = preview_changes(self.root, jobs, "results/report.json", ["b.txt"])
+        self.assertEqual(result["targets"], ["yi", "grand"])
+        by_name = {row["name"]: row for row in result["jobs"]}
+        self.assertEqual(by_name["yi"]["triggered_by"], ["yi"])
+        self.assertEqual(by_name["grand"]["triggered_by"], ["yi"])
+        self.assertEqual(by_name["jia"]["triggered_by"], [])
+        self.assertEqual(by_name["bing"]["triggered_by"], [])
+
+    def test_changes_multiple_hits_merge_and_ignore_order(self):
+        jobs = self._changes_jobs()
+        expected = preview_changes(self.root, jobs, "results/report.json",
+                                   ["a.txt", "c.txt"])
+        self.assertEqual(expected["targets"],
+                         ["jia", "yi", "grand", "bing", "other"])
+        # Repeated, differently-spelled and reordered paths resolve to the
+        # same set and must not change the preview.
+        variants = [
+            ["c.txt", "a.txt"],
+            ["a.txt", "a.txt", "c.txt"],
+            ["./a.txt", "c.txt", "a.txt"],
+            ["a.txt", "c.txt", "unmatched.txt"],
+        ]
+        for changed in variants:
+            with self.subTest(changed=changed):
+                self.assertEqual(
+                    preview_changes(self.root, jobs, "results/report.json", changed),
+                    expected)
+        by_name = {row["name"]: row for row in expected["jobs"]}
+        # yi and grand are reached only via jia; bing is its own hit (and is
+        # also yi's prerequisite); other reads c.txt itself, so it triggers
+        # itself and is not reached through bing.
+        self.assertEqual(by_name["jia"]["triggered_by"], ["jia"])
+        self.assertEqual(by_name["bing"]["triggered_by"], ["bing"])
+        self.assertEqual(by_name["other"]["triggered_by"], ["other"])
+        self.assertEqual(by_name["yi"]["triggered_by"], ["jia", "bing"])
+        self.assertEqual(by_name["grand"]["triggered_by"], ["jia", "bing"])
+
+    def test_changes_shared_input_matches_every_using_job(self):
+        jobs = [
+            {"name": "p", "operation": "count-lines", "input": "shared.txt"},
+            {"name": "q", "operation": "count-lines", "input": "shared.txt",
+             "depends_on": ["p"]},
+            {"name": "r", "operation": "count-lines", "input": "notes.txt"},
+        ]
+        result = preview_changes(self.root, jobs, "results/report.json",
+                                 ["shared.txt"])
+        self.assertEqual(result["targets"], ["p", "q"])
+        by_name = {row["name"]: row for row in result["jobs"]}
+        self.assertEqual(by_name["p"]["triggered_by"], ["p"])
+        self.assertEqual(by_name["q"]["triggered_by"], ["p", "q"])
+
+    def test_changes_empty_list_and_unmatched_paths_give_empty_scope(self):
+        jobs = self._changes_jobs()
+        for changed in ([], ["nope.txt"], ["nope.txt", "deep/missing.txt"]):
+            with self.subTest(changed=changed):
+                self.assertEqual(
+                    preview_changes(self.root, jobs, "results/report.json", changed),
+                    {"targets": [], "jobs": []})
+
+    def test_changes_does_not_execute_read_or_write(self):
+        jobs = [
+            {"name": "missing", "operation": "count-lines", "input": "nope.txt"},
+            {"name": "bad-op", "operation": "shell", "input": "a.txt"},
+            {"name": "down", "operation": "csv-summary", "input": "a.txt",
+             "depends_on": ["missing"]},
+        ]
+        (self.root / "a.txt").write_text("not csv", encoding="utf-8")
+        before = {p.name for p in self.root.iterdir()}
+        result = preview_changes(self.root, jobs, "deep/new/out.json", ["nope.txt"])
+        self.assertEqual(result["targets"], ["missing", "down"])
+        self.assertFalse((self.root / "deep").exists())
+        self.assertEqual({p.name for p in self.root.iterdir()}, before)
+        # An unmatched change path likewise creates nothing.
+        preview_changes(self.root, jobs, "deep/new/out.json", ["ghost.txt"])
+        self.assertFalse((self.root / "deep").exists())
+
+    def test_changes_invalid_argument_raises_value_error(self):
+        jobs = self._changes_jobs()
+        for changed in (None, "a.txt", 1, [1], [""], ["  "], ["a.txt", 1],
+                        ["/etc/passwd"], ["../outside.txt"]):
+            with self.subTest(changed=changed):
+                with self.assertRaises(ValueError):
+                    preview_changes(self.root, jobs, "results/report.json", changed)
+
+    def test_changes_symlink_boundary(self):
+        (self.root / "inside.txt").write_text("x", encoding="utf-8")
+        (self.root / "in-link.txt").symlink_to(self.root / "inside.txt")
+        (self.root / "out-link.txt").symlink_to(ROOT / "README.md")
+        jobs = [{"name": "n", "operation": "count-lines", "input": "in-link.txt"}]
+        result = preview_changes(self.root, jobs, "out.json", ["in-link.txt"])
+        self.assertEqual(result["targets"], ["n"])
+        with self.assertRaises(ValueError):
+            preview_changes(self.root, jobs, "out.json", ["out-link.txt"])
+
+    def test_changes_validates_whole_plan_and_output_even_when_empty(self):
+        # An empty scope still requires a fully valid plan and output.
+        bad_input = [
+            {"name": "healthy", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "stray", "operation": "count-lines", "input": "../outside.txt"},
+        ]
+        with self.assertRaises(ValueError):
+            preview_changes(self.root, bad_input, "out.json", [])
+        with self.assertRaises(ValueError):
+            preview_changes(self.root, bad_input, "out.json", ["notes.txt"])
+        bad_dep = [
+            {"name": "healthy", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "stray", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["ghost"]},
+        ]
+        with self.assertRaises(ValueError):
+            preview_changes(self.root, bad_dep, "out.json", [])
+        good = [{"name": "notes", "operation": "count-lines", "input": "notes.txt"}]
+        with self.assertRaises(ValueError):
+            preview_changes(self.root, good, "notes.txt", [])
+        # Validation precedes change-path checks.
+        with self.assertRaises(ValueError):
+            preview_changes(self.root, bad_input, "out.json", [1])
+
+    def test_changes_deep_chain_without_recursion(self):
+        n = 2000
+        # Forward-reference (tail-first) layout is the deepest traversal case.
+        jobs = [{"name": f"j{i}", "operation": "count-lines", "input": "a.txt",
+                 "depends_on": [f"j{i - 1}"] if i else []}
+                for i in range(n - 1, -1, -1)]
+        result = preview_changes(self.root, jobs, "out.json", ["a.txt"])
+        # Targets follow original plan order; jobs follow run order.
+        self.assertEqual(result["targets"], [f"j{i}" for i in range(n - 1, -1, -1)])
+        self.assertEqual([row["name"] for row in result["jobs"]],
+                         [f"j{i}" for i in range(n)])
+        self.assertEqual(len(result["jobs"]), n)
+
+    def test_cli_changed_flag(self):
+        for name in ("a.txt", "b.txt", "c.txt"):
+            (self.root / name).write_text("x", encoding="utf-8")
+        jobs = self._changes_jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        run = subprocess.run(prefix + ["--changed", "a.txt"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        payload = json.loads(run.stdout)
+        self.assertEqual(payload["targets"], ["jia", "yi", "grand"])
+        self.assertEqual([row["name"] for row in payload["jobs"]],
+                         ["jia", "bing", "yi", "grand"])
+        self.assertTrue(all(set(row) == {"name", "depends_on", "reason",
+                                         "required_by", "triggered_by"}
+                            for row in payload["jobs"]))
+        # Repeated flags accumulate; no --changed path ever creates output.
+        run = subprocess.run(prefix + ["--changed", "nope.txt"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), {"targets": [], "jobs": []})
+        self.assertFalse((self.root / ".results").exists())
+        run = subprocess.run(prefix + ["--changed", "a.txt", "--output",
+                                       "deep/x.json"], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertFalse((self.root / "deep").exists())
+
+    def test_cli_changed_conflicts_and_errors(self):
+        jobs = self._changes_jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        report = self.root / "keep.json"
+        report.write_text("KEEP", encoding="utf-8")
+        for extra in (["--changed", "a.txt", "--only", "jia"],
+                      ["--changed", "a.txt", "--preview"],
+                      ["--changed", "a.txt", "--retry-preview", "keep.json"],
+                      ["--changed", "a.txt", "--retry", "keep.json"],
+                      ["--changed", "a.txt", "--compare", "keep.json", "keep.json"],
+                      ["--changed", "a.txt", "--explain", "keep.json"],
+                      ["--changed", "a.txt", "--history", "keep.json"],
+                      ["--changed", "../outside.txt"],
+                      ["--changed", "a.txt", "--output", "plan.json"]):
+            run = subprocess.run(prefix + extra, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, (extra, run.stderr))
+            self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self.assertEqual(report.read_text(), "KEEP")
+        # An invalid plan is rejected before the change paths are resolved.
+        bad = [{"name": "a", "operation": "count-lines", "input": "notes.txt",
+                "depends_on": ["x"]}]
+        plan.write_text(json.dumps({"jobs": bad}))
+        run = subprocess.run(prefix + ["--changed", "a.txt"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self.assertEqual(report.read_text(), "KEEP")
 
 
     def _write_report(self, relative, payload, raw=None):

@@ -647,6 +647,96 @@ def preview_retry(root, jobs, output, report):
     return {"targets": targets, "jobs": _preview_entries(jobs, deps_by_name, targets)}
 
 
+def _resolve_changed_inputs(root, changed_inputs):
+    """Validate and resolve changed input paths; return the set of resolved paths.
+
+    ``changed_inputs`` must be a list of nonblank strings; each is resolved
+    against root exactly like a task input, so absolute paths and symlink
+    escapes raise ValueError. Inputs are never read: missing files are fine.
+    Paths spelling the same resolved location merge into one entry, and
+    argument order is irrelevant.
+    """
+    if not isinstance(changed_inputs, list):
+        raise ValueError("changed_inputs must be a list of path strings")
+    if any(not isinstance(path, str) or not path.strip() for path in changed_inputs):
+        raise ValueError("changed_inputs entries must be nonblank strings")
+    return {local_path(root, path) for path in changed_inputs}
+
+
+def preview_changes(root, jobs, output, changed_inputs):
+    """Preview the plan scope implied by changed task inputs, read-only.
+
+    The whole plan, every task input path and the output path are validated
+    first, exactly like ``preview_plan`` (even when the resulting scope is
+    empty), before any change path is examined. ``changed_inputs`` is a list
+    of root-relative paths (an empty list is allowed); entries must be
+    nonblank strings and are resolved against root under the usual boundary
+    rules, so absolute paths and symlink escapes raise ValueError. Matching
+    uses the resolved paths: identical locations merge, argument order is
+    irrelevant, the files need not exist and their contents are never read;
+    a legal path that no task uses as an input produces no target.
+
+    Returns ``{"targets": [...], "jobs": [...]}``. The targets list, in
+    original plan order, covers every job whose own input path resolves to a
+    changed location plus every downstream job reached through
+    ``depends_on``, each once. The jobs cover those targets and every
+    prerequisite, in the same run processing order and with the same
+    ``depends_on``, ``reason`` and ``required_by`` semantics as
+    ``preview_plan`` with targets; each entry additionally carries
+    ``triggered_by``: the directly-hit target jobs (the job itself included
+    when it is directly hit) from which the job is reachable along
+    dependency edges, in plan order without repeats, or ``[]`` for a job
+    included only to complete a prerequisite. With no direct hits or an
+    empty change list the result is ``{"targets": [], "jobs": []}``.
+
+    Nothing is executed or written, task inputs and old reports are never
+    read, and no directory is created; validation failures raise ValueError.
+    """
+    deps_by_name, _report_path = _validate_plan(root, jobs, output)
+    changed = _resolve_changed_inputs(root, changed_inputs)
+    input_by_name = {job["name"]: local_path(root, job["input"]) for job in jobs}
+    direct_hits = [job["name"] for job in jobs
+                   if input_by_name[job["name"]] in changed]
+    if not direct_hits:
+        return {"targets": [], "jobs": []}
+
+    # Reverse edges: a directly hit job affects every job that depends on
+    # it, directly or transitively, regardless of plan ordering.
+    dependents = {name: [] for name in deps_by_name}
+    for name, deps in deps_by_name.items():
+        for dep in deps:
+            dependents[dep].append(name)
+    affected = set(direct_hits)
+    stack = list(direct_hits)
+    while stack:
+        name = stack.pop()
+        for dependent in dependents[name]:
+            if dependent not in affected:
+                affected.add(dependent)
+                stack.append(dependent)
+    targets = [job["name"] for job in jobs if job["name"] in affected]
+    entries = _preview_entries(jobs, deps_by_name, targets)
+
+    # Each direct hit triggers itself and every downstream job in its
+    # affected closure. Direct hits are walked in plan order and each
+    # reached job once, so the lists are plan-ordered and repeat-free
+    # independently of the change-path argument order.
+    triggered_by = {entry["name"]: [] for entry in entries}
+    for hit in direct_hits:
+        seen = {hit}
+        stack = [hit]
+        while stack:
+            name = stack.pop()
+            triggered_by[name].append(hit)
+            for dependent in dependents[name]:
+                if dependent not in seen:
+                    seen.add(dependent)
+                    stack.append(dependent)
+    for entry in entries:
+        entry["triggered_by"] = triggered_by[entry["name"]]
+    return {"targets": targets, "jobs": entries}
+
+
 def _run_selected(root, selected, deps_by_name, report_path):
     """Execute an already-selected plan-ordered job list and write its report.
 
@@ -741,8 +831,18 @@ def main():
                         help="explain read-only why the report's failed/blocked tasks did not pass")
     parser.add_argument("--history", action="append", default=None, metavar="REPORT",
                         help="show each task's record across REPORT (repeatable), read-only")
+    parser.add_argument("--changed", action="append", default=None, metavar="PATH",
+                        help="preview targets affected by changed input PATH (repeatable), read-only")
     args = parser.parse_args()
     try:
+        if args.changed is not None and (args.only is not None or args.preview
+                                         or args.retry_preview is not None
+                                         or args.retry is not None
+                                         or args.compare is not None
+                                         or args.explain is not None
+                                         or args.history is not None):
+            raise ValueError("--changed cannot be combined with --only, --preview, "
+                             "--retry-preview, --retry, --compare, --explain or --history")
         if args.history is not None and (args.preview or args.retry_preview is not None
                                          or args.retry is not None
                                          or args.compare is not None
@@ -774,6 +874,11 @@ def main():
         if plan == local_path(args.root, args.output):
             raise ValueError("report cannot overwrite its plan")
         jobs = json.loads(plan.read_text(encoding="utf-8"))["jobs"]
+        if args.changed is not None:
+            print(json.dumps(preview_changes(args.root, jobs, args.output,
+                                             args.changed),
+                             ensure_ascii=False, indent=2))
+            return 0
         if args.history is not None:
             print(_compare_dumps(query_history(args.root, jobs, args.output,
                                                args.history, targets=args.only)))
