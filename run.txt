@@ -33,6 +33,19 @@ failures print {"targets": [], "jobs": []}. Nothing runs or is written; a bad,
 missing or escaping report path exits 2 with an error JSON. Cannot combine with
 --preview or --only.
 
+Retry
+python3 job_planner.py samples/plan-dependencies.json --retry .results/deps.json --output .results/deps.json
+Reads the named report and runs its failed/blocked tasks in plan order plus every
+prerequisite (prerequisites it marked completed are rerun too; shared ones once),
+using the same order, failure records and blocked_by propagation as a normal run;
+dependencies depend only on this run's results. Reports may be partial and report
+may equal --output (targets come from the pre-overwrite content). The returned and
+written records cover only this run's scope; unrelated branches are not read or
+recorded. No failures prints {"completed":0,"failed":0}, exits 0 and writes nothing.
+A missing, bad or escaping report, or plan validation failure, exits 2 with an
+error JSON without running tasks; a report write failure exits 2 with executed
+tasks not undone. Cannot combine with --preview, --retry-preview or --only.
+
 Smoke Test
 python3 -B -m unittest -v
 Checks real file operations, recorded errors, directory boundaries, symlinks,

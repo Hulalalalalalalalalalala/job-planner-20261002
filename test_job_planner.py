@@ -4,7 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from job_planner import execute_job, local_path, preview_plan, preview_retry, run_plan
+from job_planner import execute_job, local_path, preview_plan, preview_retry, run_plan, run_retry
 
 ROOT = Path(__file__).resolve().parent
 
@@ -645,6 +645,178 @@ class JobPlannerTests(unittest.TestCase):
         bad = [{"name": "a", "operation": "count-lines", "input": "notes.txt", "depends_on": ["x"]}]
         plan.write_text(json.dumps({"jobs": bad}))
         run = subprocess.run(prefix + ["--retry-preview", "old.json"], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self.assertEqual(report.read_text(), "KEEP")
+
+
+    def test_run_retry_targets_prerequisites_and_report_scope(self):
+        jobs = self._retry_jobs()
+        run_plan(self.root, jobs, "results/report.json")
+        result = run_retry(self.root, jobs, "results/retry.json", "results/report.json")
+        self.assertEqual([row["name"] for row in result],
+                         ["broken", "downstream", "grandchild", "healthy", "joiner"])
+        by_name = {row["name"]: row for row in result}
+        self.assertEqual(by_name["broken"]["status"], "failed")
+        self.assertEqual(by_name["healthy"]["status"], "completed")
+        self.assertEqual(by_name["downstream"],
+                         {"name": "downstream", "status": "blocked", "blocked_by": ["broken"]})
+        self.assertEqual(by_name["grandchild"],
+                         {"name": "grandchild", "status": "blocked", "blocked_by": ["downstream"]})
+        self.assertEqual(by_name["joiner"],
+                         {"name": "joiner", "status": "blocked", "blocked_by": ["broken"]})
+        # The completed, unrelated branch is neither run nor recorded.
+        self.assertNotIn("unrelated", by_name)
+        # The report keeps only this run's records, in run order.
+        saved = json.loads((self.root / "results/retry.json").read_text())["results"]
+        self.assertEqual(saved, result)
+
+    def test_run_retry_reruns_completed_prerequisites_and_shared_once(self):
+        jobs = self._retry_jobs()
+        run_plan(self.root, jobs, "r.json")
+        fixed = [dict(job) for job in jobs]
+        fixed[0]["operation"] = "count-lines"
+        # report == output: targets are taken from the pre-overwrite content.
+        result = run_retry(self.root, fixed, "r.json", "r.json")
+        names = [row["name"] for row in result]
+        self.assertEqual(names, ["broken", "downstream", "grandchild", "healthy", "joiner"])
+        self.assertEqual(names.count("healthy"), 1)
+        self.assertTrue(all(row["status"] == "completed" for row in result))
+        self.assertEqual(
+            [row["name"] for row in json.loads((self.root / "r.json").read_text())["results"]],
+            names)
+
+    def test_run_retry_partial_report_pulls_required_unrecorded(self):
+        jobs = self._retry_jobs()
+        self._write_report("partial.json", {"results": [
+            {"name": "joiner", "status": "blocked"},
+            {"name": "downstream", "status": "failed"},
+        ]})
+        result = run_retry(self.root, jobs, "out.json", "partial.json")
+        self.assertEqual([row["name"] for row in result],
+                         ["broken", "downstream", "healthy", "joiner"])
+
+    def test_run_retry_unrelated_branch_is_never_read(self):
+        jobs = self._retry_jobs()
+        run_plan(self.root, jobs, "full.json")
+        # Make the unrelated task unreadable/illegal; it must never execute.
+        (self.root / "sales.csv").unlink()
+        jobs[5]["operation"] = "shell"
+        result = run_retry(self.root, jobs, "out.json", "full.json")
+        self.assertEqual([row["name"] for row in result],
+                         ["broken", "downstream", "grandchild", "healthy", "joiner"])
+
+    def test_run_retry_empty_range_has_no_side_effects(self):
+        jobs = [
+            {"name": "notes", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "sales", "operation": "csv-summary", "input": "sales.csv"},
+        ]
+        self._write_report("empty.json", {"results": []})
+        self.assertEqual(run_retry(self.root, jobs, "deep/out.json", "empty.json"), [])
+        self.assertFalse((self.root / "deep").exists())
+        self._write_report("done.json", {"results": [
+            {"name": "notes", "status": "completed"}, {"name": "sales", "status": "completed"}]})
+        marker = self._write_report("keep.json", {"results": [{"name": "kept"}]})
+        before = marker.read_text()
+        self.assertEqual(run_retry(self.root, jobs, "keep.json", "done.json"), [])
+        self.assertEqual(marker.read_text(), before)
+        self.assertFalse((self.root / "deep").exists())
+
+    def test_run_retry_validates_whole_plan_and_report_first(self):
+        jobs = self._retry_jobs()
+        self._write_report("empty.json", {"results": []})
+        bad_input = [
+            {"name": "healthy", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "stray", "operation": "count-lines", "input": "../outside.txt"},
+        ]
+        with self.assertRaises(ValueError):
+            run_retry(self.root, bad_input, "out.json", "empty.json")
+        bad_dep = [
+            {"name": "healthy", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "stray", "operation": "count-lines", "input": "notes.txt", "depends_on": ["ghost"]},
+        ]
+        with self.assertRaises(ValueError):
+            run_retry(self.root, bad_dep, "out.json", "empty.json")
+        good = [{"name": "notes", "operation": "count-lines", "input": "notes.txt"}]
+        with self.assertRaises(ValueError):
+            run_retry(self.root, good, "notes.txt", "empty.json")
+        # Bad reports raise ValueError and leave the output untouched.
+        marker = self._write_report("keep.json", {"results": []})
+        run_plan(self.root, jobs, "full.json")
+        for raw in (b"{not json", b'{"results": [{"name": "ghost", "status": "completed"}]}',
+                    b'{"results": [{"name": "healthy", "status": "done"}]}'):
+            self._write_report("bad.json", None, raw=raw)
+            with self.assertRaises(ValueError):
+                run_retry(self.root, jobs, "keep.json", "bad.json")
+        with self.assertRaises(ValueError):
+            run_retry(self.root, jobs, "keep.json", "missing.json")
+        self.assertEqual(marker.read_text(), json.dumps({"results": []}))
+
+    def test_run_retry_write_failure_raises_oserror_without_undoing(self):
+        jobs = [{"name": "notes", "operation": "count-lines", "input": "notes.txt"}]
+        self._write_report("failed.json", {"results": [{"name": "notes", "status": "failed"}]})
+        (self.root / "blocker").write_text("file")
+        with self.assertRaises(OSError):
+            run_retry(self.root, jobs, "blocker/report.json", "failed.json")
+        self.assertEqual((self.root / "notes.txt").read_text(), "one\ntwo\n")
+
+    def test_cli_retry_flag(self):
+        jobs = self._retry_jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json", "--root", str(self.root)]
+        # Full run then a retry reading and writing the same report.
+        run = subprocess.run(prefix + ["--output", "old.json"], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 1)
+        run = subprocess.run(prefix + ["--output", "old.json", "--retry", "old.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertEqual(json.loads(run.stdout),
+                         {"completed": 1, "failed": 1, "blocked": 3})
+        report = json.loads((self.root / "old.json").read_text())["results"]
+        self.assertEqual([row["name"] for row in report],
+                         ["broken", "downstream", "grandchild", "healthy", "joiner"])
+        # Fix the failing operation: the next retry completes the whole scope.
+        fixed = [dict(job) for job in jobs]
+        fixed[0]["operation"] = "count-lines"
+        plan.write_text(json.dumps({"jobs": fixed}))
+        run = subprocess.run(prefix + ["--output", "old.json", "--retry", "old.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout),
+                         {"completed": 5, "failed": 0, "blocked": 0})
+        # A report with no failures: empty summary, exit 0, no directory, report untouched.
+        self._write_report("done.json", {"results": [
+            {"name": "healthy", "status": "completed"}]})
+        before = (self.root / "done.json").read_text()
+        run = subprocess.run(prefix + ["--output", "fresh/deep.json", "--retry", "done.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), {"completed": 0, "failed": 0})
+        self.assertFalse((self.root / "fresh").exists())
+        self.assertEqual((self.root / "done.json").read_text(), before)
+
+    def test_cli_retry_conflicts_and_errors(self):
+        jobs = self._retry_jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json", "--root", str(self.root)]
+        report = self.root / "old.json"
+        report.write_text("KEEP", encoding="utf-8")
+        for extra in (["--retry", "old.json", "--preview"],
+                      ["--retry", "old.json", "--only", "healthy"],
+                      ["--retry", "old.json", "--retry-preview", "old.json"],
+                      ["--retry", "missing.json"],
+                      ["--retry", "old.json"],
+                      ["--retry", "../outside.json"]):
+            run = subprocess.run(prefix + extra, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, (extra, run.stderr))
+            self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self.assertEqual(report.read_text(), "KEEP")
+        # An invalid plan is rejected before the report is opened.
+        bad = [{"name": "a", "operation": "count-lines", "input": "notes.txt", "depends_on": ["x"]}]
+        plan.write_text(json.dumps({"jobs": bad}))
+        run = subprocess.run(prefix + ["--retry", "old.json"], capture_output=True, text=True)
         self.assertEqual(run.returncode, 2, run.stderr)
         self.assertEqual(set(json.loads(run.stdout)), {"error"})
         self.assertEqual(report.read_text(), "KEEP")

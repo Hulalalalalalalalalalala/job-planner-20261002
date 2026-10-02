@@ -251,16 +251,23 @@ def preview_retry(root, jobs, output, report):
     """
     deps_by_name, _report_path = _validate_plan(root, jobs, output)
     statuses = _read_retry_report(root, report, {job["name"] for job in jobs})
-    targets = [job["name"] for job in jobs
-               if statuses.get(job["name"]) in ("failed", "blocked")]
+    targets = _retry_targets(jobs, statuses)
     if not targets:
         return {"targets": [], "jobs": []}
     return {"targets": targets, "jobs": _preview_entries(jobs, deps_by_name, targets)}
 
 
-def run_plan(root, jobs, output, targets=None):
-    deps_by_name, report_path = _validate_plan(root, jobs, output)
-    selected = _select_jobs(jobs, targets)
+def _retry_targets(jobs, statuses):
+    """Return report-failed/blocked task names as retry targets in plan order."""
+    return [job["name"] for job in jobs
+            if statuses.get(job["name"]) in ("failed", "blocked")]
+
+
+def _execute_selected(root, selected, deps_by_name):
+    """Run selected jobs with run_plan's ordering, failure and blocking rules.
+
+    Dependencies are judged solely on the records produced by this run.
+    """
     results = []
     records = {}
     pending = {job["name"] for job in selected}
@@ -282,8 +289,53 @@ def run_plan(root, jobs, output, targets=None):
                 result = {"name": name, "status": "failed", "error": str(exc)}
         records[name] = result["status"]
         results.append(result)
+    return results
+
+
+def _write_report(report_path, results):
+    """Persist only this run's results to the report path."""
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps({"results": results}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def run_plan(root, jobs, output, targets=None):
+    deps_by_name, report_path = _validate_plan(root, jobs, output)
+    selected = _select_jobs(jobs, targets)
+    results = _execute_selected(root, selected, deps_by_name)
+    _write_report(report_path, results)
+    return results
+
+
+def run_retry(root, jobs, output, report):
+    """Execute a manual retry derived from a historical run report.
+
+    The whole plan is validated exactly like a run, and the report follows
+    the same format and rules as in ``preview_retry``. Tasks recorded as
+    ``failed`` or ``blocked`` become the retry targets in current plan
+    order; the scope covers those targets and every prerequisite,
+    including prerequisites the report marked completed (a manual rerun
+    reprocesses them); shared prerequisites run once. The report may cover
+    a partial run: unrecorded tasks run only when they are required
+    prerequisites, and unrelated branches are neither read nor recorded.
+
+    Execution order, failure records and blocking propagation match
+    ``run_plan``; dependency decisions use only this run's results. The
+    output report saves only this run's results, never copies old records,
+    and ``report`` may equal ``output`` (targets come from the content
+    before it is overwritten). With no retry targets the empty list is
+    returned without reading task inputs, creating directories or
+    rewriting the report. Invalid plans or reports raise ValueError;
+    failures creating the output directory or writing the report raise
+    OSError and executed tasks are not undone.
+    """
+    deps_by_name, report_path = _validate_plan(root, jobs, output)
+    statuses = _read_retry_report(root, report, {job["name"] for job in jobs})
+    targets = _retry_targets(jobs, statuses)
+    if not targets:
+        return []
+    selected = _select_jobs(jobs, targets)
+    results = _execute_selected(root, selected, deps_by_name)
+    _write_report(report_path, results)
     return results
 
 
@@ -298,8 +350,13 @@ def main():
                         help="print the jobs that would run with reasons, then exit 0")
     parser.add_argument("--retry-preview", metavar="REPORT",
                         help="print targets and jobs a retry of REPORT would run, then exit 0")
+    parser.add_argument("--retry", metavar="REPORT",
+                        help="run a manual retry from a historical run report, then write --output")
     args = parser.parse_args()
     try:
+        if args.retry is not None and (args.preview or args.only is not None
+                                       or args.retry_preview is not None):
+            raise ValueError("--retry cannot be combined with --preview, --only or --retry-preview")
         if args.retry_preview is not None and (args.preview or args.only is not None):
             raise ValueError("--retry-preview cannot be combined with --preview or --only")
         plan = local_path(args.root, args.plan)
@@ -314,10 +371,16 @@ def main():
             print(json.dumps(preview_plan(args.root, jobs, args.output, targets=args.only),
                              ensure_ascii=False, indent=2))
             return 0
-        results = run_plan(args.root, jobs, args.output, targets=args.only)
+        if args.retry is not None:
+            results = run_retry(args.root, jobs, args.output, args.retry)
+            scoped = [job for job in jobs
+                      if job["name"] in {row["name"] for row in results}]
+        else:
+            results = run_plan(args.root, jobs, args.output, targets=args.only)
+            scoped = _select_jobs(jobs, args.only)
         summary = {"completed": sum(row["status"] == "completed" for row in results),
                    "failed": sum(row["status"] == "failed" for row in results)}
-        if any(job.get("depends_on") for job in _select_jobs(jobs, args.only)):
+        if any(job.get("depends_on") for job in scoped):
             summary["blocked"] = sum(row["status"] == "blocked" for row in results)
         print(json.dumps(summary))
         return 1 if any(row["status"] in ("failed", "blocked") for row in results) else 0
