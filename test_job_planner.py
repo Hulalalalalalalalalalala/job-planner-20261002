@@ -4,7 +4,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from job_planner import execute_job, local_path, preview_plan, preview_retry, run_plan, run_retry
+from job_planner import (compare_reports, execute_job, local_path, preview_plan,
+                         preview_retry, run_plan, run_retry)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -885,6 +886,298 @@ class JobPlannerTests(unittest.TestCase):
         payload = json.loads((self.root / "same.json").read_text())["results"]
         self.assertEqual([row["name"] for row in payload],
                          ["broken", "downstream", "grandchild", "healthy", "joiner"])
+
+
+    def _compare_jobs(self):
+        return [
+            {"name": "broken", "operation": "shell", "input": "notes.txt"},
+            {"name": "downstream", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["broken"]},
+            {"name": "healthy", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "newjob", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "gone", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "stable", "operation": "count-lines", "input": "notes.txt"},
+        ]
+
+    def test_compare_statuses_changes_order_and_entry_shape(self):
+        jobs = self._compare_jobs()
+        self._write_report("before.json", {"results": [
+            {"name": "stable", "status": "completed", "result": {"lines": 2}},
+            {"name": "gone", "status": "completed", "result": {"lines": 2}},
+            {"name": "healthy", "status": "completed", "result": {"lines": 2}},
+            {"name": "downstream", "status": "blocked", "blocked_by": ["broken"], "x": 9},
+            {"name": "broken", "status": "failed", "error": "boom"},
+        ]})
+        self._write_report("after.json", {"results": [
+            {"name": "newjob", "status": "failed", "error": "late"},
+            {"name": "broken", "status": "completed", "result": {"lines": 2}},
+            {"name": "downstream", "status": "blocked", "blocked_by": ["broken"]},
+            {"name": "healthy", "status": "completed", "result": {"lines": 3}},
+            {"name": "stable", "status": "completed", "result": {"lines": 2}},
+        ]})
+        result = compare_reports(self.root, jobs, "never/created.json",
+                                 "before.json", "after.json")
+        self.assertEqual([row["name"] for row in result["jobs"]],
+                         ["broken", "downstream", "healthy", "newjob", "gone", "stable"])
+        self.assertTrue(all(set(row) == {"name", "before", "after", "change"}
+                            for row in result["jobs"]))
+        by_name = {row["name"]: row for row in result["jobs"]}
+        self.assertEqual(by_name["broken"]["change"], "changed")
+        self.assertEqual(by_name["broken"]["before"],
+                         {"status": "failed", "error": "boom"})
+        self.assertEqual(by_name["broken"]["after"],
+                         {"status": "completed", "result": {"lines": 2}})
+        self.assertEqual(by_name["downstream"],
+                         {"name": "downstream",
+                          "before": {"status": "blocked", "blocked_by": ["broken"]},
+                          "after": {"status": "blocked", "blocked_by": ["broken"]},
+                          "change": "unchanged"})
+        self.assertEqual(by_name["healthy"]["change"], "changed")
+        self.assertEqual(by_name["newjob"]["before"], None)
+        self.assertEqual(by_name["newjob"]["after"],
+                         {"status": "failed", "error": "late"})
+        self.assertEqual(by_name["newjob"]["change"], "added")
+        self.assertEqual(by_name["gone"]["after"], None)
+        self.assertEqual(by_name["gone"]["before"],
+                         {"status": "completed", "result": {"lines": 2}})
+        self.assertEqual(by_name["gone"]["change"], "removed")
+        self.assertEqual(by_name["stable"]["change"], "unchanged")
+        # A task recorded on neither side never appears.
+        jobs2 = jobs + [{"name": "absent", "operation": "shell", "input": "missing.txt"}]
+        names = {row["name"] for row in
+                 compare_reports(self.root, jobs2, "never/created.json",
+                                 "before.json", "after.json")["jobs"]}
+        self.assertNotIn("absent", names)
+        # The output directory is not created and inputs need not exist.
+        self.assertFalse((self.root / "never").exists())
+
+    def test_compare_same_file_and_record_order_and_extra_fields(self):
+        jobs = self._compare_jobs()
+        self._write_report("r.json", {"results": [
+            {"name": "stable", "status": "completed", "result": {"lines": 2}, "trace": [1]},
+            {"name": "broken", "status": "failed", "error": "boom", "severity": 5},
+            {"name": "downstream", "status": "blocked", "blocked_by": ["broken"]},
+        ]})
+        result = compare_reports(self.root, jobs, "out.json", "r.json", "r.json")
+        self.assertTrue(all(row["change"] == "unchanged" for row in result["jobs"]))
+        self.assertEqual([row["name"] for row in result["jobs"]],
+                         ["broken", "downstream", "stable"])
+        self.assertTrue(all(set(row["before"]) == {"status", "error"}
+                            for row in result["jobs"]
+                            if row["name"] == "broken"))
+
+    def test_compare_json_value_equality_semantics(self):
+        jobs = [
+            {"name": "boolnum", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "intfloat", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "keyorder", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "arrorder", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "errmsg", "operation": "count-lines", "input": "notes.txt"},
+        ]
+        self._write_report("b.json", {"results": [
+            {"name": "boolnum", "status": "completed", "result": {"x": True}},
+            {"name": "intfloat", "status": "completed", "result": {"x": 1}},
+            {"name": "keyorder", "status": "completed", "result": {"a": 1, "nested": {"p": 1, "q": 2}}},
+            {"name": "arrorder", "status": "completed", "result": {"xs": [1, 2]}},
+            {"name": "errmsg", "status": "failed", "error": "old"},
+        ]})
+        self._write_report("a.json", {"results": [
+            {"name": "boolnum", "status": "completed", "result": {"x": 1}},
+            {"name": "intfloat", "status": "completed", "result": {"x": 1.0}},
+            {"name": "keyorder", "status": "completed", "result": {"nested": {"q": 2, "p": 1}, "a": 1}},
+            {"name": "arrorder", "status": "completed", "result": {"xs": [2, 1]}},
+            {"name": "errmsg", "status": "failed", "error": "new"},
+        ]})
+        changes = {row["name"]: row["change"] for row in
+                   compare_reports(self.root, jobs, "out.json", "b.json", "a.json")["jobs"]}
+        self.assertEqual(changes, {"boolnum": "changed", "intfloat": "unchanged",
+                                   "keyorder": "unchanged", "arrorder": "changed",
+                                   "errmsg": "changed"})
+
+    def test_compare_blocked_by_is_a_set_in_declaration_order(self):
+        jobs = [
+            {"name": "p", "operation": "shell", "input": "notes.txt"},
+            {"name": "q", "operation": "shell", "input": "notes.txt"},
+            {"name": "join", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["p", "q"]},
+        ]
+        self._write_report("b.json", {"results": [
+            {"name": "join", "status": "blocked", "blocked_by": ["q", "p"]},
+            {"name": "p", "status": "failed", "error": "e"},
+            {"name": "q", "status": "failed", "error": "e"},
+        ]})
+        self._write_report("a.json", {"results": [
+            {"name": "q", "status": "failed", "error": "e"},
+            {"name": "p", "status": "failed", "error": "e"},
+            {"name": "join", "status": "blocked", "blocked_by": ["p", "q"]},
+        ]})
+        result = compare_reports(self.root, jobs, "out.json", "b.json", "a.json")
+        by_name = {row["name"]: row for row in result["jobs"]}
+        self.assertTrue(all(row["change"] == "unchanged" for row in result["jobs"]))
+        # Both sides are emitted in current declaration order.
+        self.assertEqual(by_name["join"]["before"]["blocked_by"], ["p", "q"])
+        self.assertEqual(by_name["join"]["after"]["blocked_by"], ["p", "q"])
+        # A genuinely different blocked_by set is a change.
+        self._write_report("a2.json", {"results": [
+            {"name": "p", "status": "failed", "error": "e"},
+            {"name": "join", "status": "blocked", "blocked_by": ["p"]},
+        ]})
+        changes = {row["name"]: row["change"] for row in
+                   compare_reports(self.root, jobs, "out.json", "b.json", "a2.json")["jobs"]}
+        self.assertEqual(changes["join"], "changed")
+
+    def test_compare_strict_payload_validation(self):
+        jobs = self._compare_jobs()
+        self._write_report("ok.json", {"results": []})
+        cases = {
+            "completed-no-result": '{"results":[{"name":"healthy","status":"completed"}]}',
+            "completed-result-list": '{"results":[{"name":"healthy","status":"completed","result":[1]}]}',
+            "completed-result-null": '{"results":[{"name":"healthy","status":"completed","result":null}]}',
+            "failed-no-error": '{"results":[{"name":"broken","status":"failed"}]}',
+            "failed-error-number": '{"results":[{"name":"broken","status":"failed","error":5}]}',
+            "blocked-no-field": '{"results":[{"name":"downstream","status":"blocked"}]}',
+            "blocked-empty": '{"results":[{"name":"downstream","status":"blocked","blocked_by":[]}]}',
+            "blocked-duplicate": '{"results":[{"name":"downstream","status":"blocked","blocked_by":["broken","broken"]}]}',
+            "blocked-not-direct": '{"results":[{"name":"downstream","status":"blocked","blocked_by":["healthy"]}]}',
+            "blocked-unknown": '{"results":[{"name":"downstream","status":"blocked","blocked_by":["ghost"]}]}',
+        }
+        for label, raw in cases.items():
+            with self.subTest(label=label):
+                self._write_report(f"{label}.json", None, raw=raw.encode("utf-8"))
+                with self.assertRaises(ValueError):
+                    compare_reports(self.root, jobs, "out.json", f"{label}.json", "ok.json")
+
+    def test_compare_report_file_and_structure_rules_match_retry(self):
+        jobs = self._compare_jobs()
+        run_plan(self.root, jobs, "results/report.json")
+        raw_cases = {
+            "bad-encoding": b'{"results": []}\xff',
+            "bad-json": b"{not json",
+            "not-object": b"[1, 2]",
+            "no-results": b"{}",
+            "results-not-list": b'{"results": {}}',
+            "entry-not-object": b'{"results": [1]}',
+            "no-name": b'{"results": [{"status": "completed", "result": {}}]}',
+            "unknown-name": b'{"results": [{"name": "ghost", "status": "completed", "result": {}}]}',
+            "duplicate-name": b'{"results": [{"name": "healthy", "status": "completed", "result": {}},'
+                              b' {"name": "healthy", "status": "failed", "error": "x"}]}',
+            "bad-status": b'{"results": [{"name": "healthy", "status": "done"}]}',
+        }
+        for label, raw in raw_cases.items():
+            with self.subTest(label=label):
+                self._write_report(f"{label}.json", None, raw=raw)
+                with self.assertRaises(ValueError):
+                    compare_reports(self.root, jobs, "out.json", f"{label}.json",
+                                    "results/report.json")
+        for bad in ("missing.json", "../outside.json", str(ROOT / "README.md")):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    compare_reports(self.root, jobs, "out.json", bad, "results/report.json")
+        # A symlink that leaves root is rejected; one staying inside is followed.
+        (self.root / "sub").mkdir()
+        (self.root / "sub/real.json").write_text(
+            json.dumps({"results": [{"name": "healthy", "status": "completed",
+                                     "result": {"lines": 2}}]}), encoding="utf-8")
+        (self.root / "in-link.json").symlink_to(self.root / "sub/real.json")
+        compare_reports(self.root, jobs, "out.json", "in-link.json", "in-link.json")
+        (self.root / "out-link.json").symlink_to(ROOT / "README.md")
+        with self.assertRaises(ValueError):
+            compare_reports(self.root, jobs, "out.json", "out-link.json", "in-link.json")
+
+    def test_compare_validates_whole_plan_and_output_without_touching_files(self):
+        self._write_report("empty.json", {"results": []})
+        bad_input = [
+            {"name": "healthy", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "stray", "operation": "count-lines", "input": "../outside.txt"},
+        ]
+        with self.assertRaises(ValueError):
+            compare_reports(self.root, bad_input, "out.json", "empty.json", "empty.json")
+        bad_dep = [
+            {"name": "healthy", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "a", "operation": "count-lines", "input": "notes.txt", "depends_on": ["b"]},
+            {"name": "b", "operation": "count-lines", "input": "notes.txt", "depends_on": ["a"]},
+        ]
+        with self.assertRaises(ValueError):
+            compare_reports(self.root, bad_dep, "out.json", "empty.json", "empty.json")
+        good = [{"name": "notes", "operation": "count-lines", "input": "notes.txt"}]
+        with self.assertRaises(ValueError):
+            compare_reports(self.root, good, "notes.txt", "empty.json", "empty.json")
+        # No task input is read and no directory or file is created.
+        before = {p.name for p in self.root.iterdir()}
+        jobs = [{"name": "missing", "operation": "count-lines", "input": "nope.txt"}]
+        self.assertEqual(compare_reports(self.root, jobs, "deep/new/out.json",
+                                         "empty.json", "empty.json"), {"jobs": []})
+        self.assertFalse((self.root / "deep").exists())
+        self.assertEqual({p.name for p in self.root.iterdir()}, before)
+
+    def test_cli_compare_flag(self):
+        jobs = self._compare_jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json", "--root", str(self.root)]
+        self._write_report("before.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "boom"},
+            {"name": "gone", "status": "completed", "result": {"lines": 2}},
+        ]})
+        self._write_report("after.json", {"results": [
+            {"name": "broken", "status": "completed", "result": {"lines": 2}},
+            {"name": "newjob", "status": "blocked", "blocked_by": []},
+        ]})
+        # The blocked_by [] payload is invalid, so this after report must fail;
+        # replace it with a valid one for the success path.
+        run = subprocess.run(prefix + ["--compare", "before.json", "after.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self._write_report("after.json", {"results": [
+            {"name": "broken", "status": "completed", "result": {"lines": 2}},
+            {"name": "newjob", "status": "failed", "error": "late"},
+        ]})
+        run = subprocess.run(prefix + ["--compare", "before.json", "after.json"],
+                             capture_output=True, text=True)
+        # Failed records in either report still mean a successful comparison: exit 0.
+        self.assertEqual(run.returncode, 0, run.stderr)
+        payload = json.loads(run.stdout)
+        self.assertEqual([row["name"] for row in payload["jobs"]],
+                         ["broken", "newjob", "gone"])
+        self.assertEqual([row["change"] for row in payload["jobs"]],
+                         ["changed", "added", "removed"])
+        # Same file for both paths is accepted.
+        run = subprocess.run(prefix + ["--compare", "before.json", "before.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue(all(row["change"] == "unchanged"
+                            for row in json.loads(run.stdout)["jobs"]))
+        # The default output path is never created.
+        self.assertFalse((self.root / ".results").exists())
+
+    def test_cli_compare_conflicts_plan_protection_and_errors(self):
+        jobs = self._compare_jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json", "--root", str(self.root)]
+        self._write_report("r.json", {"results": []})
+        marker = self.root / "keep.json"
+        marker.write_text("KEEP", encoding="utf-8")
+        for extra in (["--compare", "r.json", "r.json", "--preview"],
+                      ["--compare", "r.json", "r.json", "--only", "healthy"],
+                      ["--compare", "r.json", "r.json", "--retry", "r.json"],
+                      ["--compare", "r.json", "r.json", "--retry-preview", "r.json"],
+                      ["--compare", "missing.json", "r.json"],
+                      ["--compare", "r.json", "../outside.json"],
+                      ["--compare", "r.json", "r.json", "--output", "notes.txt"],
+                      ["--compare", "r.json", "r.json", "--output", "plan.json"]):
+            run = subprocess.run(prefix + extra, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, (extra, run.stderr))
+            self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self.assertEqual(marker.read_text(), "KEEP")
+        bad = [{"name": "a", "operation": "count-lines", "input": "notes.txt", "depends_on": ["x"]}]
+        plan.write_text(json.dumps({"jobs": bad}))
+        run = subprocess.run(prefix + ["--compare", "r.json", "r.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self.assertEqual(marker.read_text(), "KEEP")
 
 
 if __name__ == "__main__":

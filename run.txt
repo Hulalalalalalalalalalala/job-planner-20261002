@@ -45,8 +45,22 @@ equal --output (targets use the pre-overwrite content). No targets prints
 plans exit 2 with an error JSON; output write failures exit 2 without undoing
 finished tasks. Cannot combine with --only, --preview or --retry-preview.
 
+Compare
+python3 job_planner.py samples/plan-dependencies.json --compare .results/deps.json .results/deps.json
+Reads two reports without running anything and prints {"jobs": [...]}, one
+entry per task recorded in either report in plan order, each with name,
+before, after (null on the missing side; otherwise just status plus
+result/error/blocked_by) and change: added, removed, changed or unchanged.
+Status or payload differences count (including error text); result compares
+as JSON (true is not 1, object key order is ignored, array order matters) and
+blocked_by compares as a set and prints in current dependency order. Both
+paths may be the same file. A valid comparison exits 0 even with failed
+records; bad reports/payloads, escaping paths or a bad plan exit 2 with an
+error JSON. Nothing is created or written. Cannot combine with --only,
+--preview, --retry-preview or --retry.
+
 Smoke Test
 python3 -B -m unittest -v
 Checks real file operations, recorded errors, directory boundaries, symlinks,
-dependency validation/blocking, plan and retry previews, manual retries and
-the CLI.
+dependency validation/blocking, plan and retry previews, manual retries,
+report comparison and the CLI.
