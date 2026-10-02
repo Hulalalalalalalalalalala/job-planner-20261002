@@ -272,9 +272,9 @@ def _read_compare_report(root, report, deps_by_name, exact_numbers=False):
     returned in current declaration order so callers compare it as a set
     independently of report record order. Any violation raises ValueError.
 
-    Only the compare entry point passes ``exact_numbers``: then every
-    JSON number is kept as ``Decimal`` and non-JSON numeric constants are
-    rejected, while explain and history keep ordinary float parsing.
+    Only the compare and history entry points pass ``exact_numbers``: then
+    every JSON number is kept as ``Decimal`` and non-JSON numeric constants
+    are rejected, while explain keeps ordinary float parsing.
     """
     names = set(deps_by_name)
     results = _load_report_entries(root, report, names, exact_numbers=exact_numbers)
@@ -547,7 +547,10 @@ def query_history(root, jobs, output, reports, targets=None):
     ``compare_reports`` side (``result`` object, ``error`` string or
     ``blocked_by`` in current dependency declaration order); extra fields
     are ignored. A missing record is never a failure and is never filled
-    from a neighbouring report.
+    from a neighbouring report. Numbers nested anywhere in a completed
+    ``result`` preserve the report's exact decimal value as numbers
+    (``Decimal``) — no float rounding, infinity or underflow to zero —
+    matching ``compare_reports`` exactly.
 
     Without targets only tasks appearing in at least one report are
     listed, so all-empty reports give ``{"jobs": []}``. With targets the
@@ -559,7 +562,11 @@ def query_history(root, jobs, output, reports, targets=None):
     first, exactly like ``compare_reports``, then every report is fully
     validated under that entry point's strict rules — including records
     outside the target scope — so no partial history is returned on
-    error. ``reports`` must be a nonempty list of nonblank path strings
+    error. As in ``compare_reports``, syntactically legal long decimals
+    and exponents outside float range are accepted, while ``NaN``,
+    ``Infinity`` and ``-Infinity`` reject a report even inside an
+    otherwise ignored extra field (the same words inside strings are
+    fine). ``reports`` must be a nonempty list of nonblank path strings
     (repeats allowed); it or an illegal target raises ValueError too.
     Nothing is executed, created or written, task inputs are never read,
     and a report path may equal ``output``.
@@ -576,7 +583,8 @@ def query_history(root, jobs, output, reports, targets=None):
         wanted = None
     report_records = []
     for report in reports:
-        records = _read_compare_report(root, report, deps_by_name)
+        records = _read_compare_report(root, report, deps_by_name,
+                                       exact_numbers=True)
         report_records.append(records)
     history_jobs = []
     for job in jobs:
@@ -757,9 +765,8 @@ def main():
             raise ValueError("report cannot overwrite its plan")
         jobs = json.loads(plan.read_text(encoding="utf-8"))["jobs"]
         if args.history is not None:
-            print(json.dumps(query_history(args.root, jobs, args.output,
-                                           args.history, targets=args.only),
-                             ensure_ascii=False, indent=2))
+            print(_compare_dumps(query_history(args.root, jobs, args.output,
+                                              args.history, targets=args.only)))
             return 0
         if args.compare is not None:
             print(_compare_dumps(compare_reports(args.root, jobs, args.output,

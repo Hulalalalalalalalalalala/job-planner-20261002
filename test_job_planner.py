@@ -1568,6 +1568,151 @@ class JobPlannerTests(unittest.TestCase):
         self.assertEqual(by_name["join"]["history"][0]["record"],
                          {"status": "blocked", "blocked_by": ["p", "q"]})
 
+    def test_history_preserves_exact_decimal_numbers_at_any_depth(self):
+        from decimal import Decimal
+        jobs = self._history_jobs()
+        raw = (
+            '{"results": ['
+            '{"name": "healthy", "status": "completed", "result": {'
+            '"a": 0.10000000000000001, "b": 9007199254740993.0, '
+            '"big": 1e400, "tiny": 1e-400, "neg": -0, '
+            '"nested": {"deep": [2e400, 10e399], "flag": true, '
+            '"text": "1.0", "also": 0.1}}}]}'
+        )
+        self._write_report("nums.json", None, raw=raw.encode("utf-8"))
+        result = query_history(self.root, jobs, "out.json", ["nums.json"])
+        self.assertEqual([row["name"] for row in result["jobs"]], ["healthy"])
+        payload = result["jobs"][0]["history"][0]["record"]["result"]
+        # Fractional/exponent literals are kept as numeric Decimal at every
+        # nesting level (object fields and array elements): not float-rounded
+        # and not a string. Integer literals stay plain ints, as on the
+        # compare side; either way the value stays an exact JSON number.
+        for label, value in (("a", payload["a"]), ("b", payload["b"]),
+                             ("big", payload["big"]), ("tiny", payload["tiny"]),
+                             ("deep0", payload["nested"]["deep"][0]),
+                             ("deep1", payload["nested"]["deep"][1]),
+                             ("also", payload["nested"]["also"])):
+            self.assertIsInstance(value, Decimal, label)
+            self.assertNotIsInstance(value, float, label)
+        self.assertIsInstance(payload["neg"], int)
+        self.assertEqual(payload["neg"], 0)
+        self.assertEqual(payload["a"], Decimal("0.10000000000000001"))
+        self.assertNotEqual(payload["a"], Decimal("0.1"))
+        self.assertEqual(payload["b"], Decimal("9007199254740993.0"))
+        self.assertNotEqual(payload["b"], Decimal("9007199254740992.0"))
+        # Beyond float range: no Infinity, no underflow to zero.
+        self.assertTrue(payload["big"].is_finite())
+        self.assertEqual(payload["big"], Decimal("1e400"))
+        self.assertNotEqual(payload["big"], Decimal("2e400"))
+        self.assertEqual(payload["nested"]["deep"][0], Decimal("2e400"))
+        self.assertEqual(payload["nested"]["deep"][1], payload["big"])
+        self.assertGreater(payload["tiny"], 0)
+        self.assertEqual(payload["tiny"], Decimal("1e-400"))
+        self.assertNotEqual(payload["tiny"], 0)
+        # Booleans stay booleans and digit-bearing strings stay strings.
+        self.assertIs(payload["nested"]["flag"], True)
+        self.assertEqual(payload["nested"]["text"], "1.0")
+        self.assertNotEqual(payload["a"], payload["nested"]["text"])
+        # The same report expresses identical values through compare_reports.
+        compared = compare_reports(self.root, jobs, "out.json",
+                                   "nums.json", "nums.json")
+        side = next(row for row in compared["jobs"] if row["name"] == "healthy")
+        self.assertEqual(side["before"]["result"], payload)
+
+    def test_history_rejects_non_json_numeric_constants_everywhere(self):
+        jobs = self._history_jobs()
+        self._write_report("ok.json", {"results": []})
+        cases = {
+            "nan-result": b'{"results":[{"name":"healthy","status":"completed",'
+                          b'"result":{"x":NaN}}]}',
+            "infinity-ignored-extra": b'{"results":[{"name":"healthy",'
+                                      b'"status":"completed","result":{"lines":1},'
+                                      b'"x":Infinity}]}',
+            "neg-infinity-failed-extra": b'{"results":[{"name":"broken",'
+                                         b'"status":"failed","error":"e",'
+                                         b'"x":-Infinity}]}',
+            "nan-blocked-extra": b'{"results":[{"name":"downstream",'
+                                 b'"status":"blocked","blocked_by":["broken"]},'
+                                 b'{"name":"broken","status":"failed",'
+                                 b'"error":"e","x":NaN}]}',
+            "infinity-top-level": b'{"results":[],"x":Infinity}',
+        }
+        for label, raw in cases.items():
+            with self.subTest(label=label):
+                self._write_report(f"{label}.json", None, raw=raw)
+                with self.assertRaises(ValueError):
+                    query_history(self.root, jobs, "out.json",
+                                  [f"{label}.json", "ok.json"])
+        # A constant in a record the --only filter would hide still rejects.
+        self._write_report("out-of-scope.json", None, raw=(
+            b'{"results":[{"name":"healthy","status":"completed",'
+            b'"result":{"lines":1}},'
+            b'{"name":"broken","status":"failed","error":"e","x":NaN}]}'))
+        with self.assertRaises(ValueError):
+            query_history(self.root, jobs, "out.json", ["out-of-scope.json"],
+                          targets=["healthy"])
+        # Every report is read, so a constant in a later report rejects too.
+        with self.assertRaises(ValueError):
+            query_history(self.root, jobs, "out.json",
+                          ["ok.json", "nan-result.json"])
+        # The same words inside strings are legal JSON and preserved verbatim.
+        self._write_report("in-strings.json", None, raw=(
+            b'{"results":[{"name":"broken","status":"failed",'
+            b'"error":"Infinity and -Infinity and NaN"},'
+            b'{"name":"healthy","status":"completed",'
+            b'"result":{"note":"NaN","lines":1}}]}'))
+        result = query_history(self.root, jobs, "out.json", ["in-strings.json"])
+        by_name = {row["name"]: row for row in result["jobs"]}
+        self.assertEqual(by_name["broken"]["history"][0]["record"]["error"],
+                         "Infinity and -Infinity and NaN")
+        self.assertEqual(by_name["healthy"]["history"][0]["record"]["result"],
+                         {"note": "NaN", "lines": 1})
+
+    def test_cli_history_prints_exact_numbers_as_json_numbers(self):
+        jobs = self._history_jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        self._write_report("nums.json", None, raw=(
+            b'{"results":[{"name":"healthy","status":"completed","result":{'
+            b'"a":0.10000000000000001,"b":9007199254740993.0,'
+            b'"big":1e400,"tiny":1e-400,"xs":[2e400],"flag":true}}]}'))
+        run = subprocess.run(prefix + ["--history", "nums.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        # Exact literals survive serialization as legal JSON number spelling;
+        # no infinity token can appear in the output.
+        for token in ("0.10000000000000001", "9007199254740993.0",
+                      "1E+400", "1E-400", "2E+400"):
+            self.assertIn(token, run.stdout)
+        self.assertNotIn("Infinity", run.stdout)
+
+        def reject_constant(value):
+            raise ValueError(value)
+
+        from decimal import Decimal
+        payload = json.loads(run.stdout, parse_float=Decimal,
+                             parse_constant=reject_constant)
+        result = payload["jobs"][0]["history"][0]["record"]["result"]
+        self.assertEqual(result["a"], Decimal("0.10000000000000001"))
+        self.assertEqual(result["b"], Decimal("9007199254740993.0"))
+        self.assertEqual(result["big"], Decimal("1e400"))
+        self.assertEqual(result["tiny"], Decimal("1e-400"))
+        self.assertEqual(result["xs"], [Decimal("2e400")])
+        self.assertIs(result["flag"], True)
+        # Constants anywhere make the CLI emit error-only JSON and exit 2.
+        self._write_report("inf.json", None, raw=(
+            b'{"results":[{"name":"healthy","status":"completed",'
+            b'"result":{"lines":1},"extra":Infinity}]}'))
+        run = subprocess.run(prefix + ["--history", "nums.json",
+                                       "--history", "inf.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        payload = json.loads(run.stdout)
+        self.assertEqual(set(payload), {"error"})
+        self.assertIsInstance(payload["error"], str)
+
     def test_history_invalid_reports_argument_raises(self):
         jobs = self._history_jobs()
         for bad in ([], "r1.json", None, [1], [""], ["  "]):

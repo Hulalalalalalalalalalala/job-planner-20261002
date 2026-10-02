@@ -84,6 +84,26 @@ reports, escaping paths or a bad plan exit 2 with an error JSON. Nothing is
 read besides the plan and report and nothing is created or written. Cannot
 combine with --only, --preview, --retry-preview, --retry or --compare.
 
+History
+python3 job_planner.py samples/plan-dependencies.json --history .results/deps.json --history .results/old.json
+Reads the named reports (repeat --history, paths may repeat and report may
+equal --output) without running anything and prints {"jobs": [...]}, one
+entry per recorded task in plan order (or exactly the --only names, with no
+prerequisite expansion); each has history slots in input order, each with
+the report path verbatim and record null when absent, otherwise just status
+plus result/error/blocked_by (blocked_by in current dependency order).
+Numbers nested in result keep their exact decimal value as JSON numbers —
+0.10000000000000001, 9007199254740993.0, 1e400 and 1e-400 are not rounded,
+infinite or zero (trailing zeros/exponent spelling may change), exactly
+like --compare; NaN, Infinity and -Infinity reject a report even in
+ignored extra fields, though long decimals and legal exponents beyond
+float range are fine. All reports and out-of-scope records are validated
+before anything is returned; a valid query exits 0 even with failed or
+blocked records, bad reports or option conflicts exit 2 with an error
+JSON and no partial history. Nothing is read besides the plan and the
+reports and nothing is created or written. Cannot combine with --preview,
+--retry-preview, --retry, --compare or --explain.
+
 Smoke Test
 python3 -B -m unittest -v
 Checks real file operations, recorded errors, directory boundaries, symlinks,
