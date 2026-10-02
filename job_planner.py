@@ -140,6 +140,40 @@ def _run_order(selected, deps_by_name):
     return ordered
 
 
+def _targeted_jobs(jobs, deps_by_name, targets):
+    """Build the preview jobs array for explicit targets plus prerequisites.
+
+    The targets are already validated; shared prerequisites appear once and
+    the order matches an actual scoped run.
+    """
+    selected = _select_jobs(jobs, targets)
+    ordered = _run_order(selected, deps_by_name)
+    explicit = set(targets)
+    required_by = {name: [] for name in ordered}
+    # Walk explicit targets in original plan order so required_by lists
+    # are independent of the target argument order.
+    for job in selected:
+        target = job["name"]
+        if target not in explicit:
+            continue
+        stack = [target]
+        seen = set()
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            required_by[node].append(target)
+            stack.extend(deps_by_name[node])
+    return [
+        {"name": name,
+         "depends_on": list(deps_by_name[name]),
+         "reason": "target" if name in explicit else "prerequisite",
+         "required_by": required_by[name]}
+        for name in ordered
+    ]
+
+
 def preview_plan(root, jobs, output, targets=None):
     """Describe what run_plan would do, without executing or touching files.
 
@@ -153,33 +187,80 @@ def preview_plan(root, jobs, output, targets=None):
     not fail a preview; validation failures still raise ValueError.
     """
     deps_by_name, _report_path = _validate_plan(root, jobs, output)
-    selected = _select_jobs(jobs, targets)
-    ordered = _run_order(selected, deps_by_name)
-    explicit = set(targets) if targets is not None else set()
-    required_by = {name: [] for name in ordered}
-    if targets is not None:
-        # Walk explicit targets in original plan order so required_by lists
-        # are independent of the target argument order.
-        for job in selected:
-            target = job["name"]
-            if target not in explicit:
-                continue
-            stack = [target]
-            seen = set()
-            while stack:
-                node = stack.pop()
-                if node in seen:
-                    continue
-                seen.add(node)
-                required_by[node].append(target)
-                stack.extend(deps_by_name[node])
-    return {"jobs": [
-        {"name": name,
-         "depends_on": list(deps_by_name[name]),
-         "reason": "all" if targets is None else ("target" if name in explicit else "prerequisite"),
-         "required_by": required_by[name]}
-        for name in ordered
-    ]}
+    if targets is None:
+        ordered = _run_order(jobs, deps_by_name)
+        entries = [
+            {"name": name, "depends_on": list(deps_by_name[name]),
+             "reason": "all", "required_by": []}
+            for name in ordered
+        ]
+    else:
+        entries = _targeted_jobs(jobs, deps_by_name, targets)
+    return {"jobs": entries}
+
+
+def _load_retry_report(root, report, names):
+    """Read and validate a historical report; return {name: status}.
+
+    The path must be relative to root and resolve (symlinks included)
+    inside it. The report must be a UTF-8 JSON object whose results list
+    holds objects with unique names matching current jobs and statuses in
+    completed/failed/blocked; other fields are ignored. Anything wrong
+    raises ValueError, including a missing or unreadable file.
+    """
+    report_path = local_path(root, report)
+    try:
+        text = report_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"report {report!r} cannot be read") from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("report is not valid JSON") from exc
+    if not isinstance(data, dict):
+        raise ValueError("report must be a JSON object")
+    rows = data.get("results")
+    if not isinstance(rows, list):
+        raise ValueError("report results must be a list")
+    statuses = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("each report result must be a JSON object")
+        name = row.get("name")
+        if not isinstance(name, str) or name not in names:
+            raise ValueError(f"report contains unknown job {name!r}")
+        if name in statuses:
+            raise ValueError(f"report repeats job {name!r}")
+        status = row.get("status")
+        if status not in ("completed", "failed", "blocked"):
+            raise ValueError(f"report job {name!r} has invalid status {status!r}")
+        statuses[name] = status
+    return statuses
+
+
+def preview_retry(root, jobs, output, report):
+    """Preview a retry of the failed or blocked jobs in a past report.
+
+    Validates the whole plan exactly like a preview, then reads only the
+    given report (which may equal output). Failed or blocked records become
+    targets, in current plan order regardless of report order; the jobs
+    array covers them and every prerequisite, using the same fields and
+    semantics as a targeted preview_plan. Prerequisites completed in the
+    report are still included because a manual rerun processes them again,
+    and unrecorded jobs are included only when they are required
+    prerequisites. With no failed or blocked record the result is
+    ``{"targets": [], "jobs": []}``. Nothing is executed, read besides the
+    plan and report, created or written; ValueError signals any invalid
+    plan, output path or report.
+    """
+    deps_by_name, _output_path = _validate_plan(root, jobs, output)
+    names = {job["name"] for job in jobs}
+    statuses = _load_retry_report(root, report, names)
+    targets = [job["name"] for job in jobs
+               if statuses.get(job["name"]) in ("failed", "blocked")]
+    if not targets:
+        return {"targets": [], "jobs": []}
+    return {"targets": targets, "jobs": _targeted_jobs(jobs, deps_by_name, targets)}
 
 
 def run_plan(root, jobs, output, targets=None):
@@ -220,12 +301,21 @@ def main():
                         help="run only this job and its prerequisites (repeatable)")
     parser.add_argument("--preview", action="store_true",
                         help="print the jobs that would run with reasons, then exit 0")
+    parser.add_argument("--retry-preview", metavar="REPORT",
+                        help="print targets/jobs for retrying failed or blocked "
+                             "jobs recorded in the given report, then exit 0")
     args = parser.parse_args()
     try:
+        if args.retry_preview is not None and (args.preview or args.only is not None):
+            raise ValueError("--retry-preview cannot be combined with --preview or --only")
         plan = local_path(args.root, args.plan)
         if plan == local_path(args.root, args.output):
             raise ValueError("report cannot overwrite its plan")
         jobs = json.loads(plan.read_text(encoding="utf-8"))["jobs"]
+        if args.retry_preview is not None:
+            print(json.dumps(preview_retry(args.root, jobs, args.output, args.retry_preview),
+                             ensure_ascii=False, indent=2))
+            return 0
         if args.preview:
             print(json.dumps(preview_plan(args.root, jobs, args.output, targets=args.only),
                              ensure_ascii=False, indent=2))
