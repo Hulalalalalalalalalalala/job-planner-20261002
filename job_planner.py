@@ -178,14 +178,14 @@ def _preview_entries(jobs, deps_by_name, targets):
     ]
 
 
-def _read_retry_report(root, report, names):
-    """Read and validate a historical run report; return {name: status}.
+def _read_report_entries(root, report, names):
+    """Read a report file and return its structurally validated result entries.
 
     Only the report file is read. The path must be relative to root and,
     after resolving symlinks, stay inside root. The report must be a UTF-8
     JSON object whose results list has object entries with names matching
-    the current plan exactly, no repeats, and one of the three statuses;
-    other fields are ignored. Any violation raises ValueError.
+    the current plan exactly, no repeats, and one of the three statuses.
+    Any violation raises ValueError.
     """
     path = local_path(root, report)
     try:
@@ -205,20 +205,29 @@ def _read_retry_report(root, report, names):
     results = data.get("results")
     if not isinstance(results, list):
         raise ValueError("report results must be a list")
-    statuses = {}
+    seen = set()
     for entry in results:
         if not isinstance(entry, dict):
             raise ValueError("each report result must be a JSON object")
         name = entry.get("name")
         if not isinstance(name, str) or name not in names:
             raise ValueError(f"report contains unknown task {name!r}")
-        if name in statuses:
+        if name in seen:
             raise ValueError(f"report repeats task {name!r}")
+        seen.add(name)
         status = entry.get("status")
         if status not in ("completed", "failed", "blocked"):
             raise ValueError(f"report task {name!r} has invalid status {status!r}")
-        statuses[name] = status
-    return statuses
+    return results
+
+
+def _read_retry_report(root, report, names):
+    """Read and validate a historical run report; return {name: status}.
+
+    Validation is ``_read_report_entries``'s; other fields are ignored.
+    """
+    return {entry["name"]: entry["status"]
+            for entry in _read_report_entries(root, report, names)}
 
 
 def preview_plan(root, jobs, output, targets=None):
@@ -333,6 +342,128 @@ def run_retry(root, jobs, output, report):
     return _run_selected(root, selected, deps_by_name, report_path)
 
 
+def _json_value_equal(left, right):
+    """Compare two decoded JSON values by value.
+
+    Booleans are distinct from numbers even though ``True == 1`` in Python;
+    numbers compare numerically, object key order is irrelevant and array
+    order matters.
+    """
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return (left.keys() == right.keys()
+                and all(_json_value_equal(left[key], right[key]) for key in left))
+    if isinstance(left, list) and isinstance(right, list):
+        return (len(left) == len(right)
+                and all(_json_value_equal(a, b) for a, b in zip(left, right)))
+    if isinstance(left, (dict, list)) or isinstance(right, (dict, list)):
+        return False
+    return type(left) is type(right) and left == right
+
+
+def _read_compare_report(root, report, deps_by_name):
+    """Read and strictly validate a report for comparison; return {name: record}.
+
+    Structure, name, status and duplicate checks are the retry report's;
+    on top of those, each record must carry the field matching its status:
+    ``completed`` needs an object ``result``, ``failed`` a string ``error``
+    and ``blocked`` a nonempty ``blocked_by`` list of distinct direct
+    dependency names from the current plan. Each returned record keeps only
+    ``status`` and that field, with ``blocked_by`` reordered to the current
+    dependency declaration order; extra report fields are dropped.
+    """
+    records = {}
+    for entry in _read_report_entries(root, report, deps_by_name):
+        name = entry["name"]
+        status = entry["status"]
+        if status == "completed":
+            result = entry.get("result")
+            if not isinstance(result, dict):
+                raise ValueError(f"report task {name!r} completed without an object result")
+            records[name] = {"status": status, "result": result}
+        elif status == "failed":
+            error = entry.get("error")
+            if not isinstance(error, str):
+                raise ValueError(f"report task {name!r} failed without a string error")
+            records[name] = {"status": status, "error": error}
+        else:
+            blocked_by = entry.get("blocked_by")
+            if (not isinstance(blocked_by, list) or not blocked_by
+                    or any(not isinstance(dep, str) for dep in blocked_by)
+                    or len(set(blocked_by)) != len(blocked_by)):
+                raise ValueError(
+                    f"report task {name!r} blocked without a valid blocked_by list")
+            declared = deps_by_name[name]
+            unknown = [dep for dep in blocked_by if dep not in declared]
+            if unknown:
+                raise ValueError(
+                    f"report task {name!r} blocked_by names non-dependency {unknown[0]!r}")
+            records[name] = {"status": status,
+                             "blocked_by": [dep for dep in declared if dep in blocked_by]}
+    return records
+
+
+def _records_equal(left, right):
+    """Compare two normalized report records, ignoring extra fields."""
+    if left["status"] != right["status"]:
+        return False
+    status = left["status"]
+    if status == "completed":
+        return _json_value_equal(left["result"], right["result"])
+    if status == "failed":
+        return left["error"] == right["error"]
+    return set(left["blocked_by"]) == set(right["blocked_by"])
+
+
+def compare_reports(root, jobs, output, before, after):
+    """Compare two run reports read-only; return ``{"jobs": [...]}``.
+
+    The whole plan (names, dependencies, every input path, including
+    unselected branches) and the output path are validated first, exactly
+    like a run, but nothing is executed, no task input is read, no
+    directory is created and nothing is written; only the two report files
+    are read. ``before`` and ``after`` may name the same file. Report
+    validation is the retry report's plus the per-status field requirements
+    of ``_read_compare_report``; any violation raises ValueError.
+
+    The result lists, in plan order, every task recorded in at least one
+    report — an unrecorded task is simply absent, never treated as failed.
+    Each entry has only ``name``, ``before``, ``after`` and ``change``: a
+    missing side is ``None`` and a present side keeps only ``status`` and
+    its matching field (``result``/``error``/``blocked_by``, the last in
+    current declaration order). ``change`` is ``added`` when only the after
+    report records the task, ``removed`` when only the before report does,
+    ``changed`` when the status or its field differs (a different failure
+    message counts) and ``unchanged`` otherwise. Record order and extra
+    fields in the reports are ignored; ``result`` compares by JSON value
+    (booleans distinct from numbers, object key order irrelevant, array
+    order significant) and ``blocked_by`` compares as a set.
+    """
+    deps_by_name, _report_path = _validate_plan(root, jobs, output)
+    before_records = _read_compare_report(root, before, deps_by_name)
+    after_records = _read_compare_report(root, after, deps_by_name)
+    compared = []
+    for job in jobs:
+        name = job["name"]
+        left = before_records.get(name)
+        right = after_records.get(name)
+        if left is None and right is None:
+            continue
+        if left is None:
+            change = "added"
+        elif right is None:
+            change = "removed"
+        elif _records_equal(left, right):
+            change = "unchanged"
+        else:
+            change = "changed"
+        compared.append({"name": name, "before": left, "after": right, "change": change})
+    return {"jobs": compared}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("plan")
@@ -346,6 +477,8 @@ def main():
                         help="print targets and jobs a retry of REPORT would run, then exit 0")
     parser.add_argument("--retry", metavar="REPORT",
                         help="rerun the report's failed/blocked tasks with their prerequisites")
+    parser.add_argument("--compare", nargs=2, default=None, metavar=("BEFORE", "AFTER"),
+                        help="compare two reports read-only and print the per-job changes")
     args = parser.parse_args()
     try:
         if args.retry_preview is not None and (args.preview or args.only is not None):
@@ -353,12 +486,22 @@ def main():
         if args.retry is not None and (args.preview or args.only is not None
                                        or args.retry_preview is not None):
             raise ValueError("--retry cannot be combined with --only, --preview or --retry-preview")
+        if args.compare is not None and (args.preview or args.only is not None
+                                         or args.retry_preview is not None
+                                         or args.retry is not None):
+            raise ValueError(
+                "--compare cannot be combined with --only, --preview, --retry-preview or --retry")
         plan = local_path(args.root, args.plan)
         if plan == local_path(args.root, args.output):
             raise ValueError("report cannot overwrite its plan")
         jobs = json.loads(plan.read_text(encoding="utf-8"))["jobs"]
         if args.retry_preview is not None:
             print(json.dumps(preview_retry(args.root, jobs, args.output, args.retry_preview),
+                             ensure_ascii=False, indent=2))
+            return 0
+        if args.compare is not None:
+            print(json.dumps(compare_reports(args.root, jobs, args.output,
+                                             args.compare[0], args.compare[1]),
                              ensure_ascii=False, indent=2))
             return 0
         if args.preview:
