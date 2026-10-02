@@ -995,6 +995,110 @@ class JobPlannerTests(unittest.TestCase):
                                    "keyorder": "unchanged", "arrorder": "changed",
                                    "errmsg": "changed"})
 
+    def test_compare_numbers_use_exact_decimal_value(self):
+        from decimal import Decimal
+        jobs = [
+            {"name": "eqforms", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "longfrac", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "bigintegers", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "overflow", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "underflow", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "nested", "operation": "count-lines", "input": "notes.txt"},
+        ]
+        self._write_report("b.json", None, raw=(
+            b'{"results":['
+            b'{"name":"eqforms","status":"completed","result":{"v":1}},'
+            b'{"name":"longfrac","status":"completed","result":{"v":0.10000000000000001}},'
+            b'{"name":"bigintegers","status":"completed","result":{"v":9007199254740992.0}},'
+            b'{"name":"overflow","status":"completed","result":{"v":1e400}},'
+            b'{"name":"underflow","status":"completed","result":{"v":1e-400}},'
+            b'{"name":"nested","status":"completed","result":{"a":[{"x":1.0}],"y":-0}}'
+            b']}'))
+        self._write_report("a.json", None, raw=(
+            b'{"results":['
+            b'{"name":"eqforms","status":"completed","result":{"v":1.0}},'
+            b'{"name":"longfrac","status":"completed","result":{"v":0.1}},'
+            b'{"name":"bigintegers","status":"completed","result":{"v":9007199254740993.0}},'
+            b'{"name":"overflow","status":"completed","result":{"v":2e400}},'
+            b'{"name":"underflow","status":"completed","result":{"v":0}},'
+            b'{"name":"nested","status":"completed","result":{"a":[{"x":1e0}],"y":0}}'
+            b']}'))
+        changes = {row["name"]: row["change"] for row in
+                   compare_reports(self.root, jobs, "out.json", "b.json", "a.json")["jobs"]}
+        self.assertEqual(changes, {"eqforms": "unchanged", "longfrac": "changed",
+                                   "bigintegers": "changed", "overflow": "changed",
+                                   "underflow": "changed", "nested": "unchanged"})
+        # 1e400 and 10e399 are the same exact decimal, while 1e0 spelling
+        # variants and negative zero are all equal forms of one/zero.
+        self._write_report("b2.json", None, raw=(
+            b'{"results":[{"name":"overflow","status":"completed",'
+            b'"result":{"v":1e400}},{"name":"eqforms","status":"completed",'
+            b'"result":{"v":1e0}},{"name":"nested","status":"completed",'
+            b'"result":{"a":[{"x":1.0}],"y":-0.0}}]}'))
+        self._write_report("a2.json", None, raw=(
+            b'{"results":[{"name":"overflow","status":"completed",'
+            b'"result":{"v":10e399}},{"name":"eqforms","status":"completed",'
+            b'"result":{"v":1}},{"name":"nested","status":"completed",'
+            b'"result":{"a":[{"x":1}],"y":0}}]}'))
+        result = compare_reports(self.root, jobs, "out.json", "b2.json", "a2.json")
+        self.assertTrue(all(row["change"] == "unchanged" for row in result["jobs"]))
+        # The returned sides keep the original numeric values and types:
+        # integers stay int, other numbers arrive as Decimal.
+        by_name = {row["name"]: row for row in result["jobs"]}
+        self.assertEqual(by_name["overflow"]["before"]["result"]["v"],
+                         Decimal("1E+400"))
+        self.assertIsInstance(by_name["overflow"]["before"]["result"]["v"], Decimal)
+
+    def test_compare_preserves_report_numbers_in_api_sides(self):
+        from decimal import Decimal
+        jobs = [{"name": "t", "operation": "count-lines", "input": "notes.txt"}]
+        self._write_report("b.json", None, raw=(
+            b'{"results":[{"name":"t","status":"completed","result":{'
+            b'"i":9007199254740993,"f":2.5,"huge":1e400,"tiny":1e-400,'
+            b'"negzero":-0,"deep":[1,1.0,1e0,{"z":0.0001}]}}]}'))
+        self._write_report("a.json", {"results": [
+            {"name": "t", "status": "failed", "error": "boom"}]})
+        row = compare_reports(self.root, jobs, "out.json", "b.json", "a.json")["jobs"][0]
+        result = row["before"]["result"]
+        self.assertIsInstance(result["i"], int)
+        self.assertEqual(result["i"], 9007199254740993)
+        self.assertEqual(result["f"], Decimal("2.5"))
+        self.assertEqual(result["huge"], Decimal("1E+400"))
+        self.assertEqual(result["tiny"], Decimal("1E-400"))
+        self.assertEqual(result["negzero"], Decimal("0"))
+        self.assertEqual(result["deep"],
+                         [1, Decimal("1.0"), Decimal("1E+0"),
+                          {"z": Decimal("0.0001")}])
+
+    def test_compare_rejects_non_json_number_constants_anywhere(self):
+        jobs = self._compare_jobs()
+        self._write_report("ok.json", {"results": []})
+        cases = {
+            "nan-in-result": b'{"results":[{"name":"healthy","status":"completed","result":{"x":NaN}}]}',
+            "inf-in-result": b'{"results":[{"name":"healthy","status":"completed","result":{"x":Infinity}}]}',
+            "neginf-in-result": b'{"results":[{"name":"healthy","status":"completed","result":{"x":-Infinity}}]}',
+            "nan-ignored-field": b'{"results":[{"name":"healthy","status":"completed","result":{},"extra":NaN}]}',
+            "inf-top-level": b'{"results":[],"x":Infinity}',
+            "neginf-blocked-record": b'{"results":[{"name":"downstream","status":"blocked",'
+                                     b'"blocked_by":["broken"],"y":-Infinity}]}',
+        }
+        for label, raw in cases.items():
+            with self.subTest(label=label):
+                self._write_report(f"{label}.json", None, raw=raw)
+                with self.assertRaises(ValueError):
+                    compare_reports(self.root, jobs, "out.json",
+                                    f"{label}.json", "ok.json")
+                with self.assertRaises(ValueError):
+                    compare_reports(self.root, jobs, "out.json",
+                                    "ok.json", f"{label}.json")
+        # The same spelling inside JSON strings is ordinary text.
+        self._write_report("text1.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "value was NaN"}]})
+        self._write_report("text2.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "value was NaN"}]})
+        result = compare_reports(self.root, jobs, "out.json", "text1.json", "text2.json")
+        self.assertEqual(result["jobs"][0]["change"], "unchanged")
+
     def test_compare_blocked_by_is_a_set_in_declaration_order(self):
         jobs = [
             {"name": "p", "operation": "shell", "input": "notes.txt"},
@@ -1151,6 +1255,43 @@ class JobPlannerTests(unittest.TestCase):
                             for row in json.loads(run.stdout)["jobs"]))
         # The default output path is never created.
         self.assertFalse((self.root / ".results").exists())
+
+    def test_cli_compare_outputs_exact_json_numbers(self):
+        from decimal import Decimal
+        jobs = [{"name": "t", "operation": "count-lines", "input": "notes.txt"}]
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        (self.root / "b.json").write_bytes(
+            b'{"results":[{"name":"t","status":"completed","result":{'
+            b'"huge":1e400,"tiny":1e-400,"long":0.10000000000000001,'
+            b'"edge":9007199254740993}}]}')
+        (self.root / "a.json").write_bytes(
+            b'{"results":[{"name":"t","status":"completed","result":{'
+            b'"huge":2e400,"tiny":0,"long":0.1,"edge":9007199254740992}}]}')
+        run = subprocess.run(prefix + ["--compare", "b.json", "a.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout)["jobs"][0]["change"], "changed")
+        # The emitted literals parse back to the exact report values and
+        # stay JSON numbers: no strings, no Infinity/NaN.
+        exact = json.loads(run.stdout, parse_float=Decimal)["jobs"][0]
+        self.assertEqual(exact["before"]["result"]["huge"], Decimal("1E+400"))
+        self.assertEqual(exact["before"]["result"]["tiny"], Decimal("1E-400"))
+        self.assertEqual(exact["before"]["result"]["long"],
+                         Decimal("0.10000000000000001"))
+        self.assertEqual(exact["before"]["result"]["edge"], 9007199254740993)
+        self.assertNotIn("Infinity", run.stdout)
+        self.assertNotIn("NaN", run.stdout)
+        # A NaN-bearing report is rejected with error-only JSON, exit 2.
+        (self.root / "nan.json").write_bytes(
+            b'{"results":[{"name":"t","status":"completed",'
+            b'"result":{},"extra":NaN}]}')
+        run = subprocess.run(prefix + ["--compare", "nan.json", "a.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertEqual(set(json.loads(run.stdout)), {"error"})
 
     def test_cli_compare_conflicts_plan_protection_and_errors(self):
         jobs = self._compare_jobs()

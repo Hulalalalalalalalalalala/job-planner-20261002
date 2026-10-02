@@ -52,8 +52,15 @@ entry per task recorded in either report in plan order, each with name,
 before, after (null on the missing side; otherwise just status plus
 result/error/blocked_by) and change: added, removed, changed or unchanged.
 Status or payload differences count (including error text); result compares
-as JSON (true is not 1, object key order is ignored, array order matters) and
-blocked_by compares as a set and prints in current dependency order. Both
+as JSON (true is not 1, a number is not a digit string, object key order is
+ignored, array order matters) and blocked_by compares as a set and prints
+in current dependency order. Numbers keep their exact decimal values: 1,
+1.0 and 1e0 are equal and -0 equals 0, while 0.10000000000000001 vs 0.1,
+9007199254740992.0 vs 9007199254740993.0, 1e400 vs 2e400 and 1e-400 vs 0
+all read changed (1e400 vs 10e399 unchanged); the output prints those
+values as JSON numbers, never strings, rounded values or Infinity. Bare
+NaN/Infinity/-Infinity tokens (even in ignored fields) exit 2 with an
+error JSON; the same words in strings are fine. Both
 paths may be the same file. A valid comparison exits 0 even with failed
 records; bad reports/payloads, escaping paths or a bad plan exit 2 with an
 error JSON. Nothing is created or written. Cannot combine with --only,

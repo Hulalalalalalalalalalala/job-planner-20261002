@@ -4,7 +4,29 @@ import csv
 import hashlib
 import io
 import json
+from decimal import Decimal
 from pathlib import Path
+
+
+def _reject_constant(token):
+    """Reject the non-JSON numeric constants NaN/Infinity/-Infinity."""
+    raise ValueError(f"{token} is not valid JSON")
+
+
+def _load_json_text(text, source):
+    """Parse JSON text without float rounding or non-JSON numeric constants.
+
+    Integer literals stay ``int``; every other number literal becomes a
+    ``Decimal`` carrying the exact decimal value the report expresses, so
+    later comparison cannot be fooled by binary-float precision loss or by
+    magnitudes outside the float range. Bare ``NaN``, ``Infinity`` and
+    ``-Infinity`` are rejected even though the stdlib accepts them by
+    default; the same spelling inside a JSON string is ordinary text.
+    """
+    try:
+        return json.loads(text, parse_float=Decimal, parse_constant=_reject_constant)
+    except ValueError as exc:
+        raise ValueError(f"report {source!r} is not valid JSON") from exc
 
 
 def local_path(root, relative):
@@ -189,7 +211,7 @@ def _preview_entries(jobs, deps_by_name, targets):
     ]
 
 
-def _load_report_entries(root, report, names):
+def _load_report_entries(root, report, names, exact_numbers=False):
     """Read a report file into its raw ``results`` entries.
 
     Only the report file is read. The path must be relative to root and,
@@ -197,6 +219,11 @@ def _load_report_entries(root, report, names):
     JSON object whose ``results`` is a list; per-entry name, status and
     payload checks are left to the caller so each entry point can enforce
     its own rules. Any violation raises ValueError.
+
+    With ``exact_numbers`` (the comparison entry points) every non-integer
+    number is parsed to an exact ``Decimal`` and bare NaN/Infinity tokens
+    are rejected; the other entry points keep the historical ``json.loads``
+    behavior.
     """
     path = local_path(root, report)
     try:
@@ -207,10 +234,13 @@ def _load_report_entries(root, report, names):
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError(f"report {report!r} is not valid UTF-8") from exc
-    try:
-        data = json.loads(text)
-    except ValueError as exc:
-        raise ValueError(f"report {report!r} is not valid JSON") from exc
+    if exact_numbers:
+        data = _load_json_text(text, report)
+    else:
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise ValueError(f"report {report!r} is not valid JSON") from exc
     if not isinstance(data, dict):
         raise ValueError("report must be a JSON object")
     results = data.get("results")
@@ -243,7 +273,7 @@ def _read_retry_report(root, report, names):
     return statuses
 
 
-def _read_compare_report(root, report, deps_by_name):
+def _read_compare_report(root, report, deps_by_name, exact_numbers=False):
     """Read and validate a report for comparison; return {name: side entry}.
 
     Structure, names, statuses and the repeat rule match the retry report,
@@ -253,9 +283,14 @@ def _read_compare_report(root, report, deps_by_name):
     dependencies. Extra entry fields are ignored. ``blocked_by`` is
     returned in current declaration order so callers compare it as a set
     independently of report record order. Any violation raises ValueError.
+
+    Only the compare entry point passes ``exact_numbers``: numbers are then
+    read exactly (int/Decimal) and non-JSON NaN/Infinity tokens rejected;
+    explain and history deliberately keep the historical float parsing.
     """
     names = set(deps_by_name)
-    results = _load_report_entries(root, report, names)
+    results = _load_report_entries(root, report, names,
+                                   exact_numbers=exact_numbers)
     records = {}
     for entry in results:
         if not isinstance(entry, dict):
@@ -298,17 +333,97 @@ def _read_compare_report(root, report, deps_by_name):
     return records
 
 
+def _exact_decimal(value):
+    """Return the exact decimal a parsed JSON number compares as.
+
+    Report numbers arrive as ``int`` or ``Decimal`` (never binary float);
+    a float is routed through ``str`` so it keeps its shortest decimal
+    spelling as well. Booleans are handled by the caller.
+    """
+    return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def _decimal_number_text(value):
+    """Render a finite Decimal as a JSON number literal of the same value.
+
+    ``str(Decimal)`` is always a legal JSON number literal (plain
+    notation for ordinary magnitudes, compact exponent notation for
+    extreme ones), round-trips to the identical Decimal, and preserves
+    negative zero. Trailing zeros and the original exponent spelling are
+    not required to be kept.
+    """
+    if not value.is_finite():
+        raise ValueError("non-finite numbers cannot be written as JSON")
+    return str(value)
+
+
+class _RawNumber(float):
+    """Float sentinel carrying an already-formatted JSON number literal."""
+
+    def __new__(cls, text):
+        obj = super().__new__(cls, 0.0)
+        obj.text = text
+        return obj
+
+
+class _ExactJSONEncoder(json.JSONEncoder):
+    """JSON encoder that writes Decimals as exact numeric literals."""
+
+    def default(self, o):
+        if isinstance(o, Decimal):
+            return _RawNumber(_decimal_number_text(o))
+        return super().default(o)
+
+    def iterencode(self, o, _one_shot=False):
+        markers = {} if self.check_circular else None
+        encoder = (json.encoder.encode_basestring_ascii
+                   if self.ensure_ascii else json.encoder.encode_basestring)
+        if self.indent is None or isinstance(self.indent, str):
+            indent = self.indent
+        else:
+            indent = " " * self.indent
+        inf = json.encoder.INFINITY
+
+        def floatstr(o, allow_nan=self.allow_nan, _inf=inf, _neginf=-inf):
+            if isinstance(o, _RawNumber):
+                return o.text
+            if o != o:
+                text = "NaN"
+            elif o == _inf:
+                text = "Infinity"
+            elif o == _neginf:
+                text = "-Infinity"
+            else:
+                return repr(o)
+            if not allow_nan:
+                raise ValueError(
+                    "Out of range float values are not JSON compliant: " + repr(o))
+            return text
+
+        return json.encoder._make_iterencode(
+            markers, self.default, encoder, indent, floatstr,
+            self.key_separator, self.item_separator, self.sort_keys,
+            self.skipkeys, _one_shot)(o, 0)
+
+
 def _json_equal(a, b):
     """Compare parsed JSON values the way JSON itself defines equality.
 
-    Booleans are not numbers (``true`` differs from ``1``), object key
-    order is irrelevant, array order is significant, and nesting is
-    compared recursively.
+    Numbers compare by their exact decimal value as written in the
+    reports, so distinct literals that binary floats would conflate
+    (``0.10000000000000001`` vs ``0.1``, ``9007199254740992.0`` vs
+    ``9007199254740993.0``, ``1e400`` vs ``2e400``) stay different, while
+    decimal spellings of the same value (``1``, ``1.0``, ``1e0``) and
+    negative versus positive zero are equal. Booleans are not numbers
+    (``true`` differs from ``1``) and numbers differ from strings with
+    the same digits. Object key order is irrelevant, array order is
+    significant, and nesting is compared recursively.
     """
     if isinstance(a, bool) or isinstance(b, bool):
         return isinstance(a, bool) and isinstance(b, bool) and a == b
-    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-        return a == b
+    if (isinstance(a, (int, float, Decimal))
+            and isinstance(b, (int, float, Decimal))):
+        return _exact_decimal(a) == _exact_decimal(b)
     if isinstance(a, dict) and isinstance(b, dict):
         return a.keys() == b.keys() and all(_json_equal(a[k], b[k]) for k in a)
     if isinstance(a, list) and isinstance(b, list):
@@ -327,17 +442,29 @@ def compare_reports(root, jobs, output, before, after):
     in current dependency declaration order). ``change`` is ``added``,
     ``removed``, ``changed`` (status or payload differs, including the
     failure message) or ``unchanged``. Result values compare as JSON
-    (booleans differ from numbers, object key order is ignored, array
-    order matters) and ``blocked_by`` compares as a set.
+    (booleans differ from numbers and from digit strings, object key order
+    is ignored, array order matters) and ``blocked_by`` compares as a set.
+    Numbers carry their exact decimal values from the reports: ``1``,
+    ``1.0`` and ``1e0`` are equal, negative zero equals zero, and
+    ``1e400`` equals ``10e399``; literals binary floats would conflate
+    stay different (``0.10000000000000001`` vs ``0.1``,
+    ``9007199254740992.0`` vs ``9007199254740993.0``, ``1e400`` vs
+    ``2e400``, ``1e-400`` vs zero). Bare NaN/Infinity tokens are rejected
+    while the reports are read, so the returned sides only ever hold
+    finite numeric values.
 
     The whole plan and output path are validated exactly like a run, but
     nothing is executed, created or written and task inputs are never
     read; ``before`` and ``after`` may name the same file. Any plan,
-    output or report violation raises ValueError.
+    output or report violation raises ValueError. Numbers are read as the
+    exact decimal values the reports express, so differing literals stay
+    different and the returned sides carry those original numeric values.
     """
     deps_by_name, _report_path = _validate_plan(root, jobs, output)
-    before_records = _read_compare_report(root, before, deps_by_name)
-    after_records = _read_compare_report(root, after, deps_by_name)
+    before_records = _read_compare_report(root, before, deps_by_name,
+                                          exact_numbers=True)
+    after_records = _read_compare_report(root, after, deps_by_name,
+                                         exact_numbers=True)
     compared = []
     for job in jobs:
         name = job["name"]
@@ -670,7 +797,8 @@ def main():
         if args.compare is not None:
             print(json.dumps(compare_reports(args.root, jobs, args.output,
                                              args.compare[0], args.compare[1]),
-                             ensure_ascii=False, indent=2))
+                             ensure_ascii=False, indent=2,
+                             cls=_ExactJSONEncoder))
             return 0
         if args.explain is not None:
             print(json.dumps(explain_report(args.root, jobs, args.output, args.explain),
