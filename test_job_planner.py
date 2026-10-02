@@ -4,8 +4,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from job_planner import (compare_reports, execute_job, local_path, preview_plan,
-                         preview_retry, run_plan, run_retry)
+from job_planner import (compare_reports, execute_job, explain_report, local_path,
+                         preview_plan, preview_retry, run_plan, run_retry)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -1175,6 +1175,339 @@ class JobPlannerTests(unittest.TestCase):
         plan.write_text(json.dumps({"jobs": bad}))
         run = subprocess.run(prefix + ["--compare", "r.json", "r.json"],
                              capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self.assertEqual(marker.read_text(), "KEEP")
+
+
+    def _explain_jobs(self):
+        return [
+            {"name": "broken", "operation": "shell", "input": "notes.txt"},
+            {"name": "downstream", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["broken"]},
+            {"name": "grandchild", "operation": "sha256", "input": "notes.txt",
+             "depends_on": ["downstream"]},
+            {"name": "joiner", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["broken", "healthy"]},
+            {"name": "healthy", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "unrelated", "operation": "csv-summary", "input": "sales.csv"},
+        ]
+
+    def test_explain_from_real_run_report(self):
+        jobs = self._explain_jobs()
+        run_plan(self.root, jobs, "results/report.json")
+        result = explain_report(self.root, jobs, "never/created.json", "results/report.json")
+        self.assertEqual([row["name"] for row in result["jobs"]],
+                         ["broken", "downstream", "grandchild", "joiner"])
+        self.assertTrue(all(set(row) == {"name", "status", "causes"}
+                            for row in result["jobs"]))
+        by_name = {row["name"]: row for row in result["jobs"]}
+        failure = {"name": "broken", "status": "failed", "error": "unsupported operation"}
+        self.assertEqual(by_name["broken"],
+                         {"name": "broken", "status": "failed", "causes": [failure]})
+        self.assertTrue(all(set(cause) == {"name", "status", "error"}
+                            for row in result["jobs"] for cause in row["causes"]))
+        # Blocked chains end at the terminal failure; intermediate blocked
+        # tasks are themselves no cause.
+        self.assertEqual(by_name["downstream"]["status"], "blocked")
+        self.assertEqual(by_name["downstream"]["causes"], [failure])
+        self.assertEqual(by_name["grandchild"]["causes"], [failure])
+        # joiner reports only its two terminal deps... healthy completed and
+        # broken failed, so just broken.
+        self.assertEqual(by_name["joiner"]["causes"], [failure])
+        # A completed task never appears as a job.
+        self.assertNotIn("healthy", by_name)
+        self.assertNotIn("unrelated", by_name)
+
+    def test_explain_error_string_is_verbatim(self):
+        jobs = self._explain_jobs()
+        self._write_report("r.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "line one\nline two", "x": 1},
+            {"name": "downstream", "status": "blocked", "blocked_by": ["broken"]},
+        ]})
+        result = explain_report(self.root, jobs, "out.json", "r.json")
+        self.assertEqual(result["jobs"][0]["causes"],
+                         [{"name": "broken", "status": "failed", "error": "line one\nline two"}])
+        self.assertEqual(result["jobs"][1]["causes"][0]["error"], "line one\nline two")
+
+    def test_explain_partial_report_unrecorded_endpoints(self):
+        jobs = self._explain_jobs()
+        # blocked chain grandchild -> downstream -> broken, where downstream
+        # is recorded blocked but broken has no record at all; joiner is
+        # blocked by unrecorded healthy plus recorded failed broken.
+        self._write_report("partial.json", {"results": [
+            {"name": "grandchild", "status": "blocked", "blocked_by": ["downstream"]},
+            {"name": "downstream", "status": "blocked", "blocked_by": ["broken"]},
+            {"name": "joiner", "status": "blocked", "blocked_by": ["broken", "healthy"]},
+            {"name": "broken", "status": "failed", "error": "boom"},
+        ]})
+        result = explain_report(self.root, jobs, "out.json", "partial.json")
+        self.assertEqual([row["name"] for row in result["jobs"]],
+                         ["broken", "downstream", "grandchild", "joiner"])
+        by_name = {row["name"]: row for row in result["jobs"]}
+        broken = {"name": "broken", "status": "failed", "error": "boom"}
+        unrecorded = {"name": "healthy", "status": "unrecorded", "error": None}
+        self.assertEqual(by_name["downstream"]["causes"], [broken])
+        self.assertEqual(by_name["grandchild"]["causes"], [broken])
+        # Causes are plan-ordered (broken precedes healthy), independent of
+        # blocked_by record order.
+        self.assertEqual(by_name["joiner"]["causes"], [broken, unrecorded])
+        # An unrecorded task that never terminates a trace is not listed.
+        self.assertNotIn("unrelated", [row["name"] for row in result["jobs"]])
+
+    def test_explain_unrecorded_only_endpoint(self):
+        jobs = [
+            {"name": "a", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "b", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["a"]},
+        ]
+        # b is blocked naming a, but a has no record: a appears only inside
+        # b's causes, never as its own jobs entry.
+        self._write_report("r.json", {"results": [
+            {"name": "b", "status": "blocked", "blocked_by": ["a"]},
+        ]})
+        self.assertEqual(explain_report(self.root, jobs, "out.json", "r.json"),
+                         {"jobs": [{"name": "b", "status": "blocked", "causes": [
+                             {"name": "a", "status": "unrecorded", "error": None}]}]})
+
+    def test_explain_blocked_by_to_completed_raises(self):
+        jobs = [
+            {"name": "base", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "mid", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["base"]},
+            {"name": "top", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["mid"]},
+        ]
+        # Completed reached directly.
+        self._write_report("r.json", {"results": [
+            {"name": "base", "status": "completed", "result": {"lines": 1}},
+            {"name": "mid", "status": "blocked", "blocked_by": ["base"]},
+        ]})
+        with self.assertRaises(ValueError):
+            explain_report(self.root, jobs, "out.json", "r.json")
+        # Completed reached only through a nested blocked chain.
+        self._write_report("r2.json", {"results": [
+            {"name": "base", "status": "completed", "result": {"lines": 1}},
+            {"name": "mid", "status": "blocked", "blocked_by": ["base"]},
+            {"name": "top", "status": "blocked", "blocked_by": ["mid"]},
+        ]})
+        with self.assertRaises(ValueError):
+            explain_report(self.root, jobs, "out.json", "r2.json")
+
+    def test_explain_uses_only_report_links_and_terminal_causes(self):
+        jobs = [
+            {"name": "broken", "operation": "shell", "input": "notes.txt"},
+            {"name": "ghostdep", "operation": "count-lines", "input": "missing.txt"},
+            {"name": "mid", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["broken", "ghostdep"]},
+            {"name": "top", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["mid"]},
+        ]
+        # The report says mid was blocked only by broken; the plan's other
+        # declared dependency ghostdep is never inferred. The failed task
+        # broken carries no blocked_by and even a report chain ending there
+        # must not pursue anything. Also 'mid' blocked must not appear among
+        # top's terminal causes.
+        self._write_report("r.json", {"results": [
+            {"name": "top", "status": "blocked", "blocked_by": ["mid"]},
+            {"name": "mid", "status": "blocked", "blocked_by": ["broken"]},
+            {"name": "broken", "status": "failed", "error": "boom"},
+        ]})
+        result = explain_report(self.root, jobs, "out.json", "r.json")
+        by_name = {row["name"]: row for row in result["jobs"]}
+        self.assertEqual(by_name["top"]["causes"],
+                         [{"name": "broken", "status": "failed", "error": "boom"}])
+        self.assertEqual(by_name["mid"]["causes"],
+                         [{"name": "broken", "status": "failed", "error": "boom"}])
+
+    def test_explain_shared_causes_dedup_and_plan_order_regardless_of_records(self):
+        jobs = [
+            {"name": "p", "operation": "shell", "input": "notes.txt"},
+            {"name": "q", "operation": "shell", "input": "notes.txt"},
+            {"name": "join", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["p", "q"]},
+        ]
+        # Same content but records listed backwards and blocked_by reversed.
+        self._write_report("r.json", {"results": [
+            {"name": "join", "status": "blocked", "blocked_by": ["q", "p"]},
+            {"name": "q", "status": "failed", "error": "q-boom"},
+            {"name": "p", "status": "failed", "error": "p-boom"},
+        ]})
+        result = explain_report(self.root, jobs, "out.json", "r.json")
+        join = {row["name"]: row for row in result["jobs"]}["join"]
+        self.assertEqual(join["causes"], [
+            {"name": "p", "status": "failed", "error": "p-boom"},
+            {"name": "q", "status": "failed", "error": "q-boom"},
+        ])
+
+    def test_explain_empty_or_only_completed(self):
+        jobs = [
+            {"name": "notes", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "sales", "operation": "csv-summary", "input": "sales.csv"},
+        ]
+        self._write_report("empty.json", {"results": []})
+        self.assertEqual(explain_report(self.root, jobs, "out.json", "empty.json"),
+                         {"jobs": []})
+        self._write_report("done.json", {"results": [
+            {"name": "sales", "status": "completed", "result": {"columns": ["a"], "rows": 1}},
+            {"name": "notes", "status": "completed", "result": {"lines": 2}},
+        ]})
+        self.assertEqual(explain_report(self.root, jobs, "out.json", "done.json"),
+                         {"jobs": []})
+
+    def test_explain_inherits_compare_payload_validation(self):
+        jobs = self._explain_jobs()
+        self._write_report("ok.json", {"results": []})
+        cases = {
+            "completed-no-result": '{"results":[{"name":"healthy","status":"completed"}]}',
+            "failed-no-error": '{"results":[{"name":"broken","status":"failed"}]}',
+            "failed-error-number": '{"results":[{"name":"broken","status":"failed","error":5}]}',
+            "blocked-no-field": '{"results":[{"name":"downstream","status":"blocked"}]}',
+            "blocked-empty": '{"results":[{"name":"downstream","status":"blocked","blocked_by":[]}]}',
+            "blocked-duplicate": '{"results":[{"name":"joiner","status":"blocked","blocked_by":["broken","broken"]}]}',
+            "blocked-not-direct": '{"results":[{"name":"downstream","status":"blocked","blocked_by":["healthy"]}]}',
+            "unknown-name": '{"results":[{"name":"ghost","status":"failed","error":"x"}]}',
+            "duplicate-name": '{"results":[{"name":"broken","status":"failed","error":"a"},'
+                              '{"name":"broken","status":"failed","error":"b"}]}',
+            "bad-status": '{"results":[{"name":"broken","status":"done"}]}',
+            "bad-json": b"{not json",
+        }
+        for label, raw in cases.items():
+            with self.subTest(label=label):
+                if isinstance(raw, bytes):
+                    self._write_report(f"{label}.json", None, raw=raw)
+                else:
+                    self._write_report(f"{label}.json", None, raw=raw.encode("utf-8"))
+                with self.assertRaises(ValueError):
+                    explain_report(self.root, jobs, "out.json", f"{label}.json")
+
+    def test_explain_report_file_rules_and_boundaries(self):
+        jobs = self._explain_jobs()
+        run_plan(self.root, jobs, "results/report.json")
+        for bad in ("missing.json", "../outside.json", str(ROOT / "README.md")):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    explain_report(self.root, jobs, "out.json", bad)
+        (self.root / "sub").mkdir()
+        (self.root / "sub/real.json").write_text(
+            json.dumps({"results": [{"name": "broken", "status": "failed",
+                                     "error": "e"}]}), encoding="utf-8")
+        (self.root / "in-link.json").symlink_to(self.root / "sub/real.json")
+        self.assertEqual(explain_report(self.root, jobs, "out.json", "in-link.json")["jobs"][0]["name"],
+                         "broken")
+        (self.root / "out-link.json").symlink_to(ROOT / "README.md")
+        with self.assertRaises(ValueError):
+            explain_report(self.root, jobs, "out.json", "out-link.json")
+
+    def test_explain_validates_whole_plan_and_output_without_touching_files(self):
+        self._write_report("empty.json", {"results": []})
+        bad_input = [
+            {"name": "healthy", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "stray", "operation": "count-lines", "input": "../outside.txt"},
+        ]
+        with self.assertRaises(ValueError):
+            explain_report(self.root, bad_input, "out.json", "empty.json")
+        bad_dep = [
+            {"name": "healthy", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "stray", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["ghost"]},
+        ]
+        with self.assertRaises(ValueError):
+            explain_report(self.root, bad_dep, "out.json", "empty.json")
+        good = [{"name": "notes", "operation": "count-lines", "input": "notes.txt"}]
+        with self.assertRaises(ValueError):
+            explain_report(self.root, good, "notes.txt", "empty.json")
+        # No task input is read and no directory or file is created, even
+        # with missing inputs and unknown operations.
+        jobs = [{"name": "missing", "operation": "shell", "input": "nope.txt"}]
+        self._write_report("r.json", {"results": [
+            {"name": "missing", "status": "failed", "error": "x"}]})
+        before = {p.name for p in self.root.iterdir()}
+        self.assertEqual(explain_report(self.root, jobs, "deep/new/out.json", "r.json"),
+                         {"jobs": [{"name": "missing", "status": "failed",
+                                    "causes": [{"name": "missing", "status": "failed",
+                                                "error": "x"}]}]})
+        self.assertFalse((self.root / "deep").exists())
+        self.assertEqual({p.name for p in self.root.iterdir()}, before)
+
+    def test_explain_report_may_equal_output(self):
+        jobs = self._explain_jobs()
+        run_plan(self.root, jobs, "same.json")
+        result = explain_report(self.root, jobs, "same.json", "same.json")
+        self.assertEqual([row["name"] for row in result["jobs"]],
+                         ["broken", "downstream", "grandchild", "joiner"])
+        # The file is untouched (still a full valid report).
+        payload = json.loads((self.root / "same.json").read_text())
+        self.assertEqual(len(payload["results"]), 6)
+
+    def test_cli_explain_flag(self):
+        jobs = self._explain_jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json", "--root", str(self.root)]
+        run = subprocess.run(prefix + ["--output", "old.json"], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 1)
+        run = subprocess.run(prefix + ["--explain", "old.json", "--output", "old.json"],
+                             capture_output=True, text=True)
+        # A valid explanation exits 0 even though it contains failures.
+        self.assertEqual(run.returncode, 0, run.stderr)
+        payload = json.loads(run.stdout)
+        self.assertEqual([row["name"] for row in payload["jobs"]],
+                         ["broken", "downstream", "grandchild", "joiner"])
+        self.assertTrue(all(set(row) == {"name", "status", "causes"}
+                            for row in payload["jobs"]))
+        self.assertEqual(payload["jobs"][0],
+                         {"name": "broken", "status": "failed",
+                          "causes": [{"name": "broken", "status": "failed",
+                                      "error": "unsupported operation"}]})
+        # A report recording only completed tasks explains nothing, exit 0.
+        run = subprocess.run(prefix + ["--only", "healthy", "--output", "ok.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0)
+        run = subprocess.run(prefix + ["--explain", "ok.json"], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), {"jobs": []})
+        # The default output directory is never created by an explanation.
+        self.assertFalse((self.root / ".results").exists())
+
+    def test_cli_explain_conflicts_and_errors(self):
+        jobs = self._explain_jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json", "--root", str(self.root)]
+        self._write_report("r.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "boom"},
+            {"name": "downstream", "status": "blocked", "blocked_by": ["broken"]},
+        ]})
+        marker = self.root / "keep.json"
+        marker.write_text("KEEP", encoding="utf-8")
+        for extra in (["--explain", "r.json", "--only", "healthy"],
+                      ["--explain", "r.json", "--preview"],
+                      ["--explain", "r.json", "--retry-preview", "r.json"],
+                      ["--explain", "r.json", "--retry", "r.json"],
+                      ["--explain", "r.json", "--compare", "r.json", "r.json"],
+                      ["--explain", "missing.json"],
+                      ["--explain", "../outside.json"],
+                      ["--explain", "r.json", "--output", "notes.txt"],
+                      ["--explain", "r.json", "--output", "plan.json"]):
+            run = subprocess.run(prefix + extra, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, (extra, run.stderr))
+            self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self.assertEqual(marker.read_text(), "KEEP")
+        # blocked_by reaching a completed record fails; invalid plan too.
+        self._write_report("bad-explain.json", {"results": [
+            {"name": "healthy", "status": "completed", "result": {"lines": 1}},
+            {"name": "broken", "status": "failed", "error": "boom"},
+            {"name": "joiner", "status": "blocked", "blocked_by": ["healthy", "broken"]},
+        ]})
+        run = subprocess.run(prefix + ["--explain", "bad-explain.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        bad = [{"name": "a", "operation": "count-lines", "input": "notes.txt",
+                "depends_on": ["x"]}]
+        plan.write_text(json.dumps({"jobs": bad}))
+        run = subprocess.run(prefix + ["--explain", "r.json"], capture_output=True, text=True)
         self.assertEqual(run.returncode, 2, run.stderr)
         self.assertEqual(set(json.loads(run.stdout)), {"error"})
         self.assertEqual(marker.read_text(), "KEEP")

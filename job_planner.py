@@ -347,6 +347,76 @@ def compare_reports(root, jobs, output, before, after):
     return {"jobs": compared}
 
 
+def explain_report(root, jobs, output, report):
+    """Explain read-only why each failed or blocked task in a report failed.
+
+    Returns ``{"jobs": [...]}`` in current plan order containing exactly the
+    tasks the report records as ``failed`` or ``blocked``; each entry has only
+    ``name``, ``status`` and ``causes``, and a report with no such records
+    yields ``{"jobs": []}``.
+
+    Causes name terminal reasons only and each has only ``name``, ``status``
+    and ``error``. A failed task's sole cause is itself, keeping the report's
+    error string verbatim. A blocked task is explained by following only that
+    report's own ``blocked_by`` chains at every level — never the plan's other
+    declared dependencies and never current file contents: a ``failed``
+    record ends its branch with that failure (its dependencies are not
+    pursued), a ``blocked`` record expands to its ``blocked_by`` entries, and
+    a name without a record ends its branch as
+    ``{"status": "unrecorded", "error": null}``. Should a ``blocked_by``
+    chain reach a task the report records as ``completed``, the whole
+    explanation raises ValueError. Causes shared through the graph are
+    deduplicated by task name and emitted in current plan order, independent
+    of report record order; unrecorded tasks appear only as trace endpoints,
+    never as jobs entries themselves.
+
+    The whole plan, every input path and the output path are validated
+    exactly like a run, including unselected branches, and the report is
+    validated with ``compare_reports``' path, encoding, structure, name,
+    status and payload rules (extra fields are ignored). Only the plan and
+    the report are read: nothing is executed, no task input is read, no
+    directory is created and nothing is written; ``report`` may equal
+    ``output``. Missing task inputs, unknown operations and bad file contents
+    never affect an explanation. Any violation raises ValueError.
+    """
+    deps_by_name, _report_path = _validate_plan(root, jobs, output)
+    records = _read_compare_report(root, report, deps_by_name)
+    plan_index = {job["name"]: i for i, job in enumerate(jobs)}
+    explained = []
+    for job in jobs:
+        name = job["name"]
+        record = records.get(name)
+        if record is None or record["status"] == "completed":
+            continue
+        if record["status"] == "failed":
+            causes = [{"name": name, "status": "failed", "error": record["error"]}]
+        else:
+            terminals = {}
+            expanded = set()
+            stack = list(record["blocked_by"])
+            while stack:
+                dep = stack.pop()
+                dep_record = records.get(dep)
+                if dep_record is None:
+                    terminals[dep] = {"name": dep, "status": "unrecorded", "error": None}
+                elif dep_record["status"] == "failed":
+                    terminals[dep] = {"name": dep, "status": "failed",
+                                      "error": dep_record["error"]}
+                elif dep_record["status"] == "blocked":
+                    # The validated plan is acyclic, but shared blocked
+                    # branches need expanding only once.
+                    if dep not in expanded:
+                        expanded.add(dep)
+                        stack.extend(dep_record["blocked_by"])
+                else:
+                    raise ValueError(
+                        f"report task {name!r}: blocked_by references completed task {dep!r}")
+            causes = [terminals[cause] for cause in
+                      sorted(terminals, key=plan_index.__getitem__)]
+        explained.append({"name": name, "status": record["status"], "causes": causes})
+    return {"jobs": explained}
+
+
 def preview_plan(root, jobs, output, targets=None):
     """Describe what run_plan would do, without executing or touching files.
 
@@ -474,8 +544,16 @@ def main():
                         help="rerun the report's failed/blocked tasks with their prerequisites")
     parser.add_argument("--compare", nargs=2, metavar=("BEFORE", "AFTER"),
                         help="compare two reports read-only and print per-task changes")
+    parser.add_argument("--explain", metavar="REPORT",
+                        help="explain read-only why the report's failed/blocked tasks failed")
     args = parser.parse_args()
     try:
+        if args.explain is not None and (args.compare is not None
+                                         or args.retry_preview is not None
+                                         or args.retry is not None
+                                         or args.preview or args.only is not None):
+            raise ValueError("--explain cannot be combined with --only, --preview, "
+                             "--retry-preview, --retry or --compare")
         if args.compare is not None and (args.preview or args.only is not None
                                          or args.retry_preview is not None
                                          or args.retry is not None):
@@ -493,6 +571,10 @@ def main():
         if args.compare is not None:
             print(json.dumps(compare_reports(args.root, jobs, args.output,
                                              args.compare[0], args.compare[1]),
+                             ensure_ascii=False, indent=2))
+            return 0
+        if args.explain is not None:
+            print(json.dumps(explain_report(args.root, jobs, args.output, args.explain),
                              ensure_ascii=False, indent=2))
             return 0
         if args.retry_preview is not None:
