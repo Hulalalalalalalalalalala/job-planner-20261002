@@ -208,8 +208,8 @@ def _reject_json_constant(value):
     raise ValueError(f"invalid JSON constant {value}")
 
 
-def _load_report_entries(root, report, names, exact_numbers=False):
-    """Read a report file into its raw ``results`` entries.
+def _load_report_data(root, report, exact_numbers=False):
+    """Read a report file into its parsed top-level JSON object.
 
     Only the report file is read. The path must be relative to root and,
     after resolving symlinks, stay inside root. The report must be a UTF-8
@@ -240,10 +240,18 @@ def _load_report_entries(root, report, names, exact_numbers=False):
         raise ValueError(f"report {report!r} is not valid JSON") from exc
     if not isinstance(data, dict):
         raise ValueError("report must be a JSON object")
-    results = data.get("results")
-    if not isinstance(results, list):
+    if not isinstance(data.get("results"), list):
         raise ValueError("report results must be a list")
-    return results
+    return data
+
+
+def _load_report_entries(root, report, names, exact_numbers=False):
+    """Read a report file into its raw ``results`` entries.
+
+    Follows ``_load_report_data`` exactly and returns only its ``results``
+    list; ``names`` is accepted for caller symmetry and not needed here.
+    """
+    return _load_report_data(root, report, exact_numbers=exact_numbers)["results"]
 
 
 def _read_retry_report(root, report, names):
@@ -270,23 +278,19 @@ def _read_retry_report(root, report, names):
     return statuses
 
 
-def _read_compare_report(root, report, deps_by_name, exact_numbers=False):
-    """Read and validate a report for comparison; return {name: side entry}.
+def _validate_compare_entries(results, deps_by_name):
+    """Validate raw ``results`` entries under the compare report's strict rules.
 
-    Structure, names, statuses and the repeat rule match the retry report,
-    but every status must carry its matching payload: ``completed`` needs an
-    object ``result``, ``failed`` a string ``error`` and ``blocked`` a
-    nonempty, duplicate-free list naming only the job's declared direct
-    dependencies. Extra entry fields are ignored. ``blocked_by`` is
-    returned in current declaration order so callers compare it as a set
-    independently of report record order. Any violation raises ValueError.
-
-    Only the compare and history entry points pass ``exact_numbers``:
-    then every JSON number is kept as ``Decimal`` and non-JSON numeric
-    constants are rejected, while explain keeps ordinary float parsing.
+    Every entry must be an object with a known, unrepeated task name and
+    one of the three statuses, and every status must carry its matching
+    payload: ``completed`` needs an object ``result``, ``failed`` a string
+    ``error`` and ``blocked`` a nonempty, duplicate-free list naming only
+    the job's declared direct dependencies. Extra entry fields are
+    ignored. Returns {name: side entry} with ``blocked_by`` in current
+    declaration order so callers compare it as a set independently of
+    report record order. Any violation raises ValueError.
     """
     names = set(deps_by_name)
-    results = _load_report_entries(root, report, names, exact_numbers=exact_numbers)
     records = {}
     for entry in results:
         if not isinstance(entry, dict):
@@ -327,6 +331,26 @@ def _read_compare_report(root, report, deps_by_name, exact_numbers=False):
             ordered = [dep for dep in declared if dep in set(blocked_by)]
             records[name] = {"status": "blocked", "blocked_by": ordered}
     return records
+
+
+def _read_compare_report(root, report, deps_by_name, exact_numbers=False):
+    """Read and validate a report for comparison; return {name: side entry}.
+
+    Structure, names, statuses and the repeat rule match the retry report,
+    but every status must carry its matching payload: ``completed`` needs an
+    object ``result``, ``failed`` a string ``error`` and ``blocked`` a
+    nonempty, duplicate-free list naming only the job's declared direct
+    dependencies. Extra entry fields are ignored. ``blocked_by`` is
+    returned in current declaration order so callers compare it as a set
+    independently of report record order. Any violation raises ValueError.
+
+    Only the compare and history entry points pass ``exact_numbers``:
+    then every JSON number is kept as ``Decimal`` and non-JSON numeric
+    constants are rejected, while explain keeps ordinary float parsing.
+    """
+    results = _load_report_entries(root, report, set(deps_by_name),
+                                   exact_numbers=exact_numbers)
+    return _validate_compare_entries(results, deps_by_name)
 
 
 def _json_equal(a, b):
@@ -608,6 +632,139 @@ def query_history(root, jobs, output, reports, targets=None):
                    for report, records in zip(reports, report_records)]
         history_jobs.append({"name": name, "history": history})
     return {"jobs": history_jobs}
+
+
+def _validate_execution_name_list(value, target_names, field, name):
+    """Check a recorded ``required_by``/``triggered_by`` list against the targets.
+
+    Only the type, duplicates and references are enforced: every entry
+    must be a string naming one of the execution's targets and no entry
+    may repeat. The recorded values themselves are trusted — the
+    historical selection is never recomputed — and returned unchanged.
+    """
+    if not isinstance(value, list):
+        raise ValueError(f"execution job {name!r}: {field} must be a list")
+    if any(not isinstance(item, str) for item in value):
+        raise ValueError(f"execution job {name!r}: {field} entries must be strings")
+    if len(set(value)) != len(value):
+        raise ValueError(f"execution job {name!r}: {field} contains a duplicate")
+    unknown = [item for item in value if item not in target_names]
+    if unknown:
+        raise ValueError(f"execution job {name!r}: {field} names {unknown[0]!r}, "
+                         "which is not an execution target")
+
+
+def query_execution(root, jobs, output, report):
+    """Return a report's recorded execution reasons, read-only.
+
+    Returns ``{"execution": ...}`` where the value is exactly the
+    ``execution`` object a ``record_reasons`` run saved in the report —
+    ``mode``, ``targets`` and ``jobs`` — reduced to the published reason
+    fields: each job keeps only ``name``, ``depends_on``, ``reason`` and
+    ``required_by``, plus ``triggered_by`` for ``changes`` mode; every
+    array keeps the order the report recorded and every value is returned
+    as recorded, never recomputed from the current plan or the run's
+    outcomes (failed and blocked records do not rewrite reasons). A
+    report without an ``execution`` field — one written before reasons
+    could be recorded or with the option off — and a report with empty
+    ``results`` both return ``{"execution": None}``.
+
+    The whole plan, every input path and the output path (``report`` may
+    equal it) are validated exactly like ``compare_reports``, and the
+    report's ``results`` must satisfy that entry point's strict rules —
+    so a partial report is valid. When ``execution`` is present it must
+    be an object: ``mode`` one of ``all``/``only``/``retry``/``changes``;
+    ``targets`` a nonempty, duplicate-free list of current plan job
+    names; ``jobs`` a nonempty list of objects whose names and order
+    match ``results`` exactly and which cover every target. Each job's
+    ``depends_on`` must equal the current declaration, ``required_by``
+    may only reference targets, ``changes`` jobs must also carry a
+    ``triggered_by`` referencing only targets, and no task-name list may
+    repeat. For ``all`` the targets must cover the whole plan and every
+    job needs reason ``all`` with an empty ``required_by``; otherwise
+    each job's reason must be ``target`` or ``prerequisite`` according to
+    whether it is a target. Beyond types, references and these
+    correspondences the recorded reason lists are not checked against the
+    dependency graph — the historical selection is preserved, not
+    recomputed. Missing fields, wrong types, unknown references, an
+    illegal mode, a broken correspondence or an ``execution`` that is
+    ``null`` all raise ValueError; extra fields are ignored.
+
+    The query reads only the plan and the named report: nothing is
+    executed, task inputs are never read, and no directory is created or
+    file written. A missing, unreadable, non-UTF-8 or invalid-JSON
+    report, an illegal payload, or an absolute or symlink-escaping path
+    raises ValueError.
+    """
+    deps_by_name, _report_path = _validate_plan(root, jobs, output)
+    data = _load_report_data(root, report)
+    results = data["results"]
+    _validate_compare_entries(results, deps_by_name)
+    if "execution" not in data:
+        return {"execution": None}
+    execution = data["execution"]
+    if execution is None:
+        raise ValueError("report execution must be an object")
+    if not results:
+        return {"execution": None}
+    if not isinstance(execution, dict):
+        raise ValueError("report execution must be an object")
+    mode = execution.get("mode")
+    if mode not in ("all", "only", "retry", "changes"):
+        raise ValueError(f"report execution has invalid mode {mode!r}")
+    targets = _validate_target_names(jobs, execution.get("targets"))
+    target_names = set(targets)
+    exec_jobs = execution.get("jobs")
+    if not isinstance(exec_jobs, list) or not exec_jobs:
+        raise ValueError("execution jobs must be a nonempty list of objects")
+    if len(exec_jobs) != len(results):
+        raise ValueError("execution jobs must match the report results one to one")
+    kept = []
+    for entry, result in zip(exec_jobs, results):
+        if not isinstance(entry, dict):
+            raise ValueError("each execution job must be an object")
+        name = entry.get("name")
+        if not isinstance(name, str) or name != result["name"]:
+            raise ValueError(
+                "execution jobs must match the report results in name and order")
+        depends_on = entry.get("depends_on")
+        if depends_on != deps_by_name[name]:
+            raise ValueError(
+                f"execution job {name!r}: depends_on differs from the current "
+                "declaration")
+        reason = entry.get("reason")
+        required_by = entry.get("required_by")
+        _validate_execution_name_list(required_by, target_names,
+                                       "required_by", name)
+        if mode == "all":
+            if reason != "all":
+                raise ValueError(
+                    f"execution job {name!r}: all mode requires reason 'all'")
+            if required_by:
+                raise ValueError(
+                    f"execution job {name!r}: all mode requires an empty "
+                    "required_by")
+        else:
+            expected = "target" if name in target_names else "prerequisite"
+            if reason != expected:
+                raise ValueError(
+                    f"execution job {name!r}: reason must be {expected!r}")
+        job = {"name": name, "depends_on": list(depends_on), "reason": reason,
+               "required_by": list(required_by)}
+        if mode == "changes":
+            triggered_by = entry.get("triggered_by")
+            _validate_execution_name_list(triggered_by, target_names,
+                                          "triggered_by", name)
+            job["triggered_by"] = list(triggered_by)
+        kept.append(job)
+    job_names = {job["name"] for job in kept}
+    missing = [target for target in targets if target not in job_names]
+    if missing:
+        raise ValueError(
+            f"execution target {missing[0]!r} is missing from execution jobs")
+    if mode == "all" and target_names != set(deps_by_name):
+        raise ValueError("all mode execution targets must cover the whole plan")
+    return {"execution": {"mode": mode, "targets": list(targets), "jobs": kept}}
 
 
 def preview_plan(root, jobs, output, targets=None):
@@ -967,6 +1124,8 @@ def main():
                         help="explain read-only why the report's failed/blocked tasks did not pass")
     parser.add_argument("--history", action="append", default=None, metavar="REPORT",
                         help="show each task's record across REPORT (repeatable), read-only")
+    parser.add_argument("--execution", metavar="REPORT",
+                        help="print the execution reasons recorded in REPORT, read-only")
     parser.add_argument("--changed", action="append", default=None, metavar="PATH",
                         help="preview tasks affected by changed input PATH (repeatable), read-only")
     parser.add_argument("--run-changed", action="append", default=None, metavar="PATH",
@@ -975,6 +1134,17 @@ def main():
                         help="record why this run happened in the report's execution object")
     args = parser.parse_args()
     try:
+        if args.execution is not None and (args.only is not None or args.record_reasons
+                                           or args.preview or args.retry_preview is not None
+                                           or args.retry is not None
+                                           or args.compare is not None
+                                           or args.explain is not None
+                                           or args.history is not None
+                                           or args.changed is not None
+                                           or args.run_changed is not None):
+            raise ValueError("--execution cannot be combined with --only, "
+                             "--record-reasons, --preview, --retry-preview, --retry, "
+                             "--compare, --explain, --history, --changed or --run-changed")
         if args.record_reasons and (args.preview or args.retry_preview is not None
                                     or args.changed is not None or args.compare is not None
                                     or args.explain is not None or args.history is not None):
@@ -1043,6 +1213,11 @@ def main():
             return 0
         if args.explain is not None:
             print(json.dumps(explain_report(args.root, jobs, args.output, args.explain),
+                             ensure_ascii=False, indent=2))
+            return 0
+        if args.execution is not None:
+            print(json.dumps(query_execution(args.root, jobs, args.output,
+                                             args.execution),
                              ensure_ascii=False, indent=2))
             return 0
         if args.retry_preview is not None:

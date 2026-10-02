@@ -5,8 +5,8 @@ import sys
 import tempfile
 import unittest
 from job_planner import (compare_reports, execute_job, explain_report, local_path,
-                         preview_changes, preview_plan, preview_retry, query_history,
-                         run_changes, run_plan, run_retry)
+                         preview_changes, preview_plan, preview_retry, query_execution,
+                         query_history, run_changes, run_plan, run_retry)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -2517,6 +2517,381 @@ class RecordReasonsTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(json.loads(run.stdout), {"completed": 0, "failed": 0})
         self.assertFalse((self.root / ".results").exists())
+
+
+class QueryExecutionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "notes.txt").write_text("one\ntwo\n", encoding="utf-8")
+        (self.root / "sales.csv").write_text("item,count\nbook,2\npen,4\n", encoding="utf-8")
+
+    def _write_report(self, relative, payload):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def _jobs(self):
+        return [
+            {"name": "base", "operation": "sha256", "input": "notes.txt"},
+            {"name": "mid", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["base"]},
+            {"name": "final", "operation": "csv-summary", "input": "sales.csv",
+             "depends_on": ["mid"]},
+        ]
+
+    def _only_report(self):
+        """A valid hand-written report carrying an ``only`` execution."""
+        return {
+            "results": [
+                {"name": "base", "status": "completed", "result": {"bytes": 8}},
+                {"name": "mid", "status": "completed", "result": {"lines": 2}},
+            ],
+            "execution": {
+                "mode": "only",
+                "targets": ["mid"],
+                "jobs": [
+                    {"name": "base", "depends_on": [], "reason": "prerequisite",
+                     "required_by": ["mid"]},
+                    {"name": "mid", "depends_on": ["base"], "reason": "target",
+                     "required_by": ["mid"]},
+                ],
+            },
+        }
+
+    def test_round_trip_returns_exactly_the_recorded_execution(self):
+        jobs = RecordReasonsTests._jobs(self)
+        run_plan(self.root, jobs, "all.json", record_reasons=True)
+        run_plan(self.root, jobs, "only.json", targets=["final", "mid"],
+                 record_reasons=True)
+        run_retry(self.root, jobs, "retry.json", "all.json", record_reasons=True)
+        run_changes(self.root, jobs, "chg.json", ["notes.txt"], record_reasons=True)
+        for name in ("all.json", "only.json", "retry.json", "chg.json"):
+            with self.subTest(name=name):
+                recorded = json.loads((self.root / name).read_text())["execution"]
+                queried = query_execution(self.root, jobs, "out.json", name)
+                self.assertEqual(queried, {"execution": recorded})
+                # Only the execution field is returned.
+                self.assertEqual(list(queried), ["execution"])
+
+    def test_failed_and_blocked_records_do_not_rewrite_reasons(self):
+        jobs = RecordReasonsTests._jobs(self)
+        run_plan(self.root, jobs, "r.json", record_reasons=True)
+        recorded = json.loads((self.root / "r.json").read_text())["execution"]
+        statuses = {row["name"]: row["status"]
+                    for row in json.loads((self.root / "r.json").read_text())["results"]}
+        self.assertEqual(statuses["broken"], "failed")
+        self.assertEqual(statuses["down"], "blocked")
+        queried = query_execution(self.root, jobs, "out.json", "r.json")["execution"]
+        self.assertEqual(queried, recorded)
+        by_name = {job["name"]: job for job in queried["jobs"]}
+        self.assertEqual(by_name["broken"]["reason"], "all")
+        self.assertEqual(by_name["down"]["reason"], "all")
+
+    def test_missing_field_and_empty_results_return_null(self):
+        jobs = self._jobs()
+        run_plan(self.root, jobs, "plain.json")
+        self.assertEqual(query_execution(self.root, jobs, "out.json", "plain.json"),
+                         {"execution": None})
+        self._write_report("empty.json", {"results": []})
+        self.assertEqual(query_execution(self.root, jobs, "out.json", "empty.json"),
+                         {"execution": None})
+        # Empty results yield null even when an execution object is present.
+        self._write_report("empty-exec.json",
+                           {"results": [], "execution": {"mode": "all",
+                                                         "targets": ["base"],
+                                                         "jobs": []}})
+        self.assertEqual(query_execution(self.root, jobs, "out.json", "empty-exec.json"),
+                         {"execution": None})
+
+    def test_null_and_non_object_execution_raise(self):
+        jobs = self._jobs()
+        report = self._only_report()
+        for bad in (None, "only", 3, ["mode"], True):
+            with self.subTest(bad=bad):
+                payload = json.loads(json.dumps(report))
+                payload["execution"] = bad
+                self._write_report("bad.json", payload)
+                with self.assertRaises(ValueError):
+                    query_execution(self.root, jobs, "out.json", "bad.json")
+
+    def test_invalid_mode_and_target_violations_raise(self):
+        jobs = self._jobs()
+        report = self._only_report()
+        bad_executions = []
+        for mode in (None, "everything", "", 1):
+            execution = json.loads(json.dumps(report["execution"]))
+            if mode is None:
+                del execution["mode"]
+            else:
+                execution["mode"] = mode
+            bad_executions.append(execution)
+        for targets in (None, [], "mid", [""], ["mid", "mid"], ["ghost"], [3]):
+            execution = json.loads(json.dumps(report["execution"]))
+            if targets is None:
+                del execution["targets"]
+            else:
+                execution["targets"] = targets
+            bad_executions.append(execution)
+        for execution in bad_executions:
+            with self.subTest(execution=execution):
+                payload = self._only_report()
+                payload["execution"] = execution
+                self._write_report("bad.json", payload)
+                with self.assertRaises(ValueError):
+                    query_execution(self.root, jobs, "out.json", "bad.json")
+
+    def test_jobs_must_match_results_in_name_and_order(self):
+        jobs = self._jobs()
+        base = self._only_report()
+        variants = []
+        # Missing / empty / non-list jobs.
+        for value in (None, [], "jobs"):
+            execution = json.loads(json.dumps(base["execution"]))
+            if value is None:
+                del execution["jobs"]
+            else:
+                execution["jobs"] = value
+            variants.append(execution)
+        # Swapped order, renamed entry, extra entry, missing entry, non-object.
+        swapped = json.loads(json.dumps(base["execution"]))
+        swapped["jobs"] = [swapped["jobs"][1], swapped["jobs"][0]]
+        variants.append(swapped)
+        renamed = json.loads(json.dumps(base["execution"]))
+        renamed["jobs"][0]["name"] = "final"
+        variants.append(renamed)
+        extra = json.loads(json.dumps(base["execution"]))
+        extra["jobs"].append({"name": "final", "depends_on": ["mid"],
+                              "reason": "prerequisite", "required_by": ["mid"]})
+        variants.append(extra)
+        short = json.loads(json.dumps(base["execution"]))
+        short["jobs"] = short["jobs"][:1]
+        variants.append(short)
+        non_object = json.loads(json.dumps(base["execution"]))
+        non_object["jobs"][0] = "base"
+        variants.append(non_object)
+        # A target no execution job covers.
+        uncovered = json.loads(json.dumps(base["execution"]))
+        uncovered["targets"] = ["mid", "final"]
+        variants.append(uncovered)
+        for execution in variants:
+            with self.subTest(execution=execution):
+                payload = self._only_report()
+                payload["execution"] = execution
+                self._write_report("bad.json", payload)
+                with self.assertRaises(ValueError):
+                    query_execution(self.root, jobs, "out.json", "bad.json")
+
+    def test_depends_on_must_match_the_current_declaration(self):
+        jobs = self._jobs()
+        for depends_on in ([], ["mid"], ["base", "base"], "base"):
+            with self.subTest(depends_on=depends_on):
+                payload = self._only_report()
+                payload["execution"]["jobs"][1]["depends_on"] = depends_on
+                self._write_report("bad.json", payload)
+                with self.assertRaises(ValueError):
+                    query_execution(self.root, jobs, "out.json", "bad.json")
+
+    def test_reason_correspondences_are_enforced(self):
+        jobs = self._jobs()
+        # "only" mode: a target recorded as prerequisite, and vice versa.
+        payload = self._only_report()
+        payload["execution"]["jobs"][1]["reason"] = "prerequisite"
+        self._write_report("bad.json", payload)
+        with self.assertRaises(ValueError):
+            query_execution(self.root, jobs, "out.json", "bad.json")
+        payload = self._only_report()
+        payload["execution"]["jobs"][0]["reason"] = "target"
+        self._write_report("bad.json", payload)
+        with self.assertRaises(ValueError):
+            query_execution(self.root, jobs, "out.json", "bad.json")
+        payload = self._only_report()
+        payload["execution"]["jobs"][0]["reason"] = "all"
+        self._write_report("bad.json", payload)
+        with self.assertRaises(ValueError):
+            query_execution(self.root, jobs, "out.json", "bad.json")
+
+    def test_all_mode_rules(self):
+        jobs = self._jobs()
+        run_plan(self.root, jobs, "all.json", record_reasons=True)
+        recorded = json.loads((self.root / "all.json").read_text())["execution"]
+        self.assertEqual(query_execution(self.root, jobs, "out.json", "all.json"),
+                         {"execution": recorded})
+        results = json.loads((self.root / "all.json").read_text())["results"]
+        # Targets not covering the whole plan.
+        payload = {"results": results,
+                   "execution": {**recorded, "targets": ["base", "mid"]}}
+        self._write_report("bad.json", payload)
+        with self.assertRaises(ValueError):
+            query_execution(self.root, jobs, "out.json", "bad.json")
+        # A non-"all" reason.
+        execution = json.loads(json.dumps(recorded))
+        execution["jobs"][0]["reason"] = "target"
+        self._write_report("bad.json", {"results": results, "execution": execution})
+        with self.assertRaises(ValueError):
+            query_execution(self.root, jobs, "out.json", "bad.json")
+        # A nonempty required_by.
+        execution = json.loads(json.dumps(recorded))
+        execution["jobs"][0]["required_by"] = ["base"]
+        self._write_report("bad.json", {"results": results, "execution": execution})
+        with self.assertRaises(ValueError):
+            query_execution(self.root, jobs, "out.json", "bad.json")
+
+    def test_changes_mode_requires_triggered_by_referencing_targets(self):
+        jobs = RecordReasonsTests._change_jobs(self)
+        (self.root / "data.bin").write_bytes(b"x")
+        (self.root / "other.txt").write_text("y\n", encoding="utf-8")
+        run_changes(self.root, jobs, "chg.json", ["notes.txt"], record_reasons=True)
+        doc = json.loads((self.root / "chg.json").read_text())
+        self.assertEqual(doc["execution"]["mode"], "changes")
+        self.assertEqual(query_execution(self.root, jobs, "out.json", "chg.json"),
+                         {"execution": doc["execution"]})
+        results = doc["results"]
+        execution = doc["execution"]
+        # Missing triggered_by.
+        broken = json.loads(json.dumps(execution))
+        for job in broken["jobs"]:
+            del job["triggered_by"]
+        self._write_report("bad.json", {"results": results, "execution": broken})
+        with self.assertRaises(ValueError):
+            query_execution(self.root, jobs, "out.json", "bad.json")
+        # triggered_by naming a non-target.
+        broken = json.loads(json.dumps(execution))
+        broken["jobs"][0]["triggered_by"] = ["unrelated"]
+        self._write_report("bad.json", {"results": results, "execution": broken})
+        with self.assertRaises(ValueError):
+            query_execution(self.root, jobs, "out.json", "bad.json")
+
+    def test_name_lists_reject_bad_types_duplicates_and_unknown_references(self):
+        jobs = self._jobs()
+        for value in ("mid", ["mid", "mid"], ["ghost"], [3], [""]):
+            with self.subTest(value=value):
+                payload = self._only_report()
+                payload["execution"]["jobs"][0]["required_by"] = value
+                self._write_report("bad.json", payload)
+                with self.assertRaises(ValueError):
+                    query_execution(self.root, jobs, "out.json", "bad.json")
+
+    def test_extra_fields_ignored_and_recorded_values_preserved(self):
+        jobs = self._jobs()
+        payload = self._only_report()
+        execution = payload["execution"]
+        execution["recorded_at"] = "never"
+        execution["jobs"][0]["triggered_by"] = ["mid"]  # extra in only mode
+        execution["jobs"][0]["note"] = {"anything": True}
+        # required_by lists are trusted, not recomputed: an empty list where
+        # the graph would imply one, and an unusual but valid order, survive.
+        execution["jobs"][0]["required_by"] = []
+        payload["results"][0]["extra"] = "ignored"
+        self._write_report("rich.json", payload)
+        queried = query_execution(self.root, jobs, "out.json", "rich.json")
+        self.assertEqual(queried, {"execution": {
+            "mode": "only",
+            "targets": ["mid"],
+            "jobs": [
+                {"name": "base", "depends_on": [], "reason": "prerequisite",
+                 "required_by": []},
+                {"name": "mid", "depends_on": ["base"], "reason": "target",
+                 "required_by": ["mid"]},
+            ]}})
+
+    def test_partial_report_is_legal_and_report_rules_are_strict(self):
+        jobs = self._jobs()
+        # The hand-written only-report covers a partial run and is legal.
+        self._write_report("partial.json", self._only_report())
+        queried = query_execution(self.root, jobs, "out.json", "partial.json")
+        self.assertEqual(queried["execution"]["mode"], "only")
+        # compare-grade report violations still raise.
+        for results in ([{"name": "ghost", "status": "completed", "result": {}}],
+                        [{"name": "base", "status": "completed"}],
+                        [{"name": "base", "status": "done"}],
+                        [{"name": "base"}, {"name": "base"}]):
+            with self.subTest(results=results):
+                payload = self._only_report()
+                payload["results"] = results
+                self._write_report("bad.json", payload)
+                with self.assertRaises(ValueError):
+                    query_execution(self.root, jobs, "out.json", "bad.json")
+        for relative in ("missing.json", str(self.root / "elsewhere.json"),
+                         "../outside.json"):
+            with self.subTest(relative=relative):
+                with self.assertRaises(ValueError):
+                    query_execution(self.root, jobs, "out.json", relative)
+        (self.root / "binary.json").write_bytes(b"\xff\xfe")
+        with self.assertRaises(ValueError):
+            query_execution(self.root, jobs, "out.json", "binary.json")
+        self._write_report("notjson.json", None)
+        (self.root / "notjson.json").write_text("{oops", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            query_execution(self.root, jobs, "out.json", "notjson.json")
+
+    def test_query_is_read_only_and_report_may_equal_output(self):
+        jobs = self._jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        run_plan(self.root, jobs, "same.json", record_reasons=True)
+        before = (self.root / "same.json").read_text()
+        queried = query_execution(self.root, jobs, "same.json", "same.json")
+        self.assertEqual(queried["execution"]["mode"], "all")
+        self.assertEqual((self.root / "same.json").read_text(), before)
+        self.assertFalse((self.root / ".results").exists())
+        # Plan and output protection rules still apply.
+        with self.assertRaises(ValueError):
+            query_execution(self.root, jobs, "notes.txt", "same.json")
+        bad = jobs + [{"name": "dup", "operation": "sha256", "input": "notes.txt"},
+                      {"name": "dup", "operation": "sha256", "input": "notes.txt"}]
+        with self.assertRaises(ValueError):
+            query_execution(self.root, bad, "out.json", "same.json")
+
+    def test_cli_execution_query_and_conflicts(self):
+        jobs = self._jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        run = subprocess.run(prefix + ["--output", "r.json", "--record-reasons"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        recorded = json.loads((self.root / "r.json").read_text())["execution"]
+        run = subprocess.run(prefix + ["--execution", "r.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), {"execution": recorded})
+        # report may equal --output.
+        run = subprocess.run(prefix + ["--execution", "r.json", "--output", "r.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        # An old report without the field yields null.
+        self._write_report("old.json", {"results": []})
+        run = subprocess.run(prefix + ["--execution", "old.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), {"execution": None})
+        # Nothing was created or written by the queries.
+        self.assertFalse((self.root / ".results").exists())
+        # Conflicts and invalid executions print error-only JSON and exit 2.
+        self._write_report("bad.json", {"results": [{"name": "base",
+                                                     "status": "completed",
+                                                     "result": {}}],
+                                        "execution": None})
+        for extra in (["--execution", "r.json", "--only", "base"],
+                      ["--execution", "r.json", "--record-reasons"],
+                      ["--execution", "r.json", "--preview"],
+                      ["--execution", "r.json", "--retry-preview", "r.json"],
+                      ["--execution", "r.json", "--retry", "r.json"],
+                      ["--execution", "r.json", "--compare", "r.json", "r.json"],
+                      ["--execution", "r.json", "--explain", "r.json"],
+                      ["--execution", "r.json", "--history", "r.json"],
+                      ["--execution", "r.json", "--changed", "notes.txt"],
+                      ["--execution", "r.json", "--run-changed", "notes.txt"],
+                      ["--execution", "bad.json"],
+                      ["--execution", "missing.json"]):
+            with self.subTest(extra=extra):
+                run = subprocess.run(prefix + extra, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                self.assertEqual(set(json.loads(run.stdout)), {"error"})
 
 
 if __name__ == "__main__":
