@@ -272,9 +272,9 @@ def _read_compare_report(root, report, deps_by_name, exact_numbers=False):
     returned in current declaration order so callers compare it as a set
     independently of report record order. Any violation raises ValueError.
 
-    Only the compare entry point passes ``exact_numbers``: then every
-    JSON number is kept as ``Decimal`` and non-JSON numeric constants are
-    rejected, while explain and history keep ordinary float parsing.
+    Only the compare and history entry points pass ``exact_numbers``:
+    then every JSON number is kept as ``Decimal`` and non-JSON numeric
+    constants are rejected, while explain keeps ordinary float parsing.
     """
     names = set(deps_by_name)
     results = _load_report_entries(root, report, names, exact_numbers=exact_numbers)
@@ -347,16 +347,16 @@ def _json_equal(a, b):
 
 
 def _encode_compare_json(value, level=0):
-    """Serialize compare output, writing ``Decimal`` numbers literally.
+    """Serialize compare/history output, writing ``Decimal`` numbers literally.
 
-    Compare-side reports parse every JSON number into the ``Decimal`` of
-    its literal text, so a plain ``json.dumps`` would turn the value into
-    a string or round it through float. This emits each ``Decimal`` via
-    ``str`` as a raw, finite JSON number — fixed point or ``E`` exponent
-    as ``Decimal`` chooses, still an exact legal number — rather than a
-    string, a rounded float or an infinity; trailing zeros and exponent
-    spelling are not guaranteed. Nested containers are indented exactly
-    like ``json.dumps(..., indent=2)``.
+    Compare- and history-side reports parse every JSON number into the
+    ``Decimal`` of its literal text, so a plain ``json.dumps`` would turn
+    the value into a string or round it through float. This emits each
+    ``Decimal`` via ``str`` as a raw, finite JSON number — fixed point or
+    ``E`` exponent as ``Decimal`` chooses, still an exact legal number —
+    rather than a string, a rounded float or an infinity; trailing zeros
+    and exponent spelling are not guaranteed. Nested containers are
+    indented exactly like ``json.dumps(..., indent=2)``.
     """
     if value is None:
         return "null"
@@ -392,7 +392,7 @@ def _encode_compare_json(value, level=0):
 
 
 def _compare_dumps(value):
-    """Serialize compare output with exact numeric values preserved."""
+    """Serialize compare/history output with exact numeric values preserved."""
     return _encode_compare_json(value)
 
 
@@ -547,7 +547,15 @@ def query_history(root, jobs, output, reports, targets=None):
     ``compare_reports`` side (``result`` object, ``error`` string or
     ``blocked_by`` in current dependency declaration order); extra fields
     are ignored. A missing record is never a failure and is never filled
-    from a neighbouring report.
+    from a neighbouring report. Numbers nested anywhere in a
+    ``completed`` record's ``result`` keep the exact decimal value the
+    report expresses, exactly as in ``compare_reports``: they are
+    returned as ``Decimal`` — never rounded to float, collapsed to zero
+    or infinity, or turned into strings — so ``0.10000000000000001``,
+    ``9007199254740993.0``, ``1e400`` and ``1e-400`` survive verbatim,
+    and ``NaN``/``Infinity``/``-Infinity`` constants anywhere in a report
+    (even in ignored extra fields) raise ValueError while the same words
+    inside strings are fine.
 
     Without targets only tasks appearing in at least one report are
     listed, so all-empty reports give ``{"jobs": []}``. With targets the
@@ -576,7 +584,8 @@ def query_history(root, jobs, output, reports, targets=None):
         wanted = None
     report_records = []
     for report in reports:
-        records = _read_compare_report(root, report, deps_by_name)
+        records = _read_compare_report(root, report, deps_by_name,
+                                       exact_numbers=True)
         report_records.append(records)
     history_jobs = []
     for job in jobs:
@@ -757,9 +766,8 @@ def main():
             raise ValueError("report cannot overwrite its plan")
         jobs = json.loads(plan.read_text(encoding="utf-8"))["jobs"]
         if args.history is not None:
-            print(json.dumps(query_history(args.root, jobs, args.output,
-                                           args.history, targets=args.only),
-                             ensure_ascii=False, indent=2))
+            print(_compare_dumps(query_history(args.root, jobs, args.output,
+                                               args.history, targets=args.only)))
             return 0
         if args.compare is not None:
             print(_compare_dumps(compare_reports(args.root, jobs, args.output,
