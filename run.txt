@@ -59,8 +59,25 @@ records; bad reports/payloads, escaping paths or a bad plan exit 2 with an
 error JSON. Nothing is created or written. Cannot combine with --only,
 --preview, --retry-preview or --retry.
 
+Explain
+python3 job_planner.py samples/plan-dependencies.json --explain .results/deps.json --output .results/deps.json
+Reads one report without running anything and prints {"jobs": [...]}, one
+entry per failed/blocked task in plan order, each with name, status and
+causes. A failed task's cause is itself with its error string; a blocked
+task follows the report's blocked_by chains to terminal failed tasks or to
+unrecorded tasks ({"status": "unrecorded", "error": null}), deduplicated by
+name and ordered by the plan. Nothing is inferred from current files or
+other declared dependencies; a blocked_by chain reaching a completed record
+exits 2 with an error JSON. Partial reports are valid and unrecorded tasks
+appear only as trace endpoints; no failures print {"jobs": []}. Report
+validation, paths and output protection match --compare; report may equal
+--output. A valid explanation exits 0 even with failed records; bad
+reports, escaping paths or a bad plan exit 2 with an error JSON. Nothing is
+read besides the plan and report and nothing is created or written. Cannot
+combine with --only, --preview, --retry-preview, --retry or --compare.
+
 Smoke Test
 python3 -B -m unittest -v
 Checks real file operations, recorded errors, directory boundaries, symlinks,
 dependency validation/blocking, plan and retry previews, manual retries,
-report comparison and the CLI.
+report comparison, failure explanation and the CLI.
