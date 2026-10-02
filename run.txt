@@ -114,6 +114,29 @@ JSON, and output write failures exit 2 without undoing finished tasks.
 Cannot combine with --only, --preview, --retry-preview, --retry,
 --compare, --explain, --history or --changed.
 
+Record reasons
+python3 job_planner.py samples/plan-dependencies.json --record-reasons
+Adds an optional record of why the run happened: the report at --output
+gains one top-level "execution" object (only when at least one task
+runs), with exactly mode, targets and jobs. mode is all for a full run,
+only for --only selections (even selecting every job), retry for
+--retry and changes for --run-changed. targets are this run's targets
+in plan order: every job, the explicit targets, the old report's
+failed/blocked jobs, or the directly changed tasks plus their
+downstream dependants. jobs use the corresponding preview's fields and
+semantics (--preview, --retry-preview or --changed), one entry per
+processed job in the same names and order as results, shared
+prerequisites once; failed and blocked jobs keep their selection
+reasons and results never rewrite them. With --retry onto the same
+file, reasons come from the pre-overwrite content. results, the printed
+counts and the exit code are unchanged and nothing but --output is
+written; no retry targets or no changed match still writes no report
+and creates no directory. The API option record_reasons accepts only a
+boolean, and --record-reasons cannot be combined with --preview,
+--retry-preview, --changed, --compare, --explain or --history (error
+JSON, exit 2). Existing readers ignore execution as an extra field and
+old reports need no changes.
+
 Smoke Test
 python3 -B -m unittest -v
 Checks real file operations, recorded errors, directory boundaries, symlinks,

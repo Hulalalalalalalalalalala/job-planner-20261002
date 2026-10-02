@@ -737,14 +737,16 @@ def preview_changes(root, jobs, output, changed_inputs):
     return {"targets": targets, "jobs": entries}
 
 
-def _run_selected(root, selected, deps_by_name, report_path):
+def _run_selected(root, selected, deps_by_name, report_path, execution=None):
     """Execute an already-selected plan-ordered job list and write its report.
 
     Processing order, failure records and blocked propagation are shared by
     every execution mode: each pass runs the earliest ready job, a failing
     or blocked direct dependency blocks dependants without reading their
     input, and only this run's results drive dependency decisions. The
-    report contains exactly these results, replacing any prior content.
+    report contains exactly these results, replacing any prior content;
+    with ``execution`` set it is recorded alongside them as the top-level
+    ``execution`` object explaining why this run happened.
     """
     results = []
     records = {}
@@ -767,18 +769,81 @@ def _run_selected(root, selected, deps_by_name, report_path):
                 result = {"name": name, "status": "failed", "error": str(exc)}
         records[name] = result["status"]
         results.append(result)
+    report = {"results": results}
+    if execution is not None:
+        report["execution"] = execution
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps({"results": results}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return results
 
 
-def run_plan(root, jobs, output, targets=None):
+def _require_bool(record_reasons):
+    """Validate the record_reasons option: only a plain bool is accepted."""
+    if not isinstance(record_reasons, bool):
+        raise ValueError("record_reasons must be a boolean")
+    return record_reasons
+
+
+def _execution_for_run(root, jobs, output, mode, targets_or_report, changed_inputs=None):
+    """Build the recorded ``execution`` object from the public previews.
+
+    The mode's corresponding preview entry point computes both ``targets``
+    and ``jobs`` exactly as users see them, so the recorded reasons can
+    never drift from preview semantics and stay independent of this run's
+    results: failed and blocked jobs keep the selection reasons they had
+    before execution. ``targets_or_report`` is the explicit target list
+    for ``"only"`` or the historical report path for ``"retry"``;
+    ``changed_inputs`` only matters for ``"changes"``. Callers guarantee
+    the scope is nonempty, so the previews' empty-list cases never
+    surface here.
+    """
+    if mode == "all":
+        preview = preview_plan(root, jobs, output, targets=None)
+        execution_targets = [job["name"] for job in jobs]
+    elif mode == "only":
+        preview = preview_plan(root, jobs, output, targets=targets_or_report)
+        chosen = set(targets_or_report)
+        execution_targets = [job["name"] for job in jobs if job["name"] in chosen]
+    elif mode == "retry":
+        preview = preview_retry(root, jobs, output, targets_or_report)
+        execution_targets = preview["targets"]
+    else:
+        preview = preview_changes(root, jobs, output, changed_inputs)
+        execution_targets = preview["targets"]
+    return {"mode": mode, "targets": execution_targets, "jobs": preview["jobs"]}
+
+
+def run_plan(root, jobs, output, targets=None, record_reasons=False):
+    """Execute the whole plan, or targets with every prerequisite.
+
+    With ``record_reasons=True`` the report additionally carries a
+    top-level ``execution`` object — ``{"mode", "targets", "jobs"}`` —
+    describing why this run happened: ``mode`` is ``"all"`` without
+    targets (an explicit selection naming every job still records
+    ``"only"``), and ``targets`` lists this run's targets in current plan
+    order — every plan job for ``"all"``, the explicit targets for
+    ``"only"``, the report's failed/blocked tasks for ``"retry"`` and the
+    directly changed tasks plus their downstream dependants for
+    ``"changes"`` — and ``jobs`` are exactly the matching public preview
+    entries (``preview_plan``, ``preview_retry`` or ``preview_changes``),
+    same names and order as the run's ``results``. Reasons reflect the
+    plan as selected, never this run's outcomes.
+    ``record_reasons`` must be a bool; other values raise ValueError. The
+    returned list, CLI statistics and exit codes are unchanged and only
+    ``output`` is ever written; with an empty scope no report is written
+    and no ``execution`` is recorded.
+    """
+    _require_bool(record_reasons)
     deps_by_name, report_path = _validate_plan(root, jobs, output)
     selected = _select_jobs(jobs, targets)
-    return _run_selected(root, selected, deps_by_name, report_path)
+    execution = None
+    if record_reasons and selected:
+        mode = "all" if targets is None else "only"
+        execution = _execution_for_run(root, jobs, output, mode, targets)
+    return _run_selected(root, selected, deps_by_name, report_path, execution)
 
 
-def run_retry(root, jobs, output, report):
+def run_retry(root, jobs, output, report, record_reasons=False):
     """Execute a manual retry derived from a historical run report.
 
     Target selection mirrors ``preview_retry``: every task the report
@@ -801,7 +866,19 @@ def run_retry(root, jobs, output, report):
     the output path are validated first; report problems raise ValueError
     exactly as in ``preview_retry``, and creating the output directory or
     writing the report may raise OSError after tasks have run.
+
+    With ``record_reasons=True`` and at least one retry target, the
+    written report additionally carries the top-level ``execution``
+    object with ``mode`` ``"retry"``; ``targets`` are the report's
+    failed/blocked tasks in current plan order and ``jobs`` are exactly
+    ``preview_retry``'s entries, same names and order as ``results``. The
+    reasons are computed from the report content read before the
+    overwrite, so when ``report`` equals ``output`` they still reflect
+    the historical run; outcomes of this run never rewrite them. With no
+    retry targets nothing is written and no ``execution`` is recorded.
+    ``record_reasons`` must be a bool; other values raise ValueError.
     """
+    _require_bool(record_reasons)
     deps_by_name, report_path = _validate_plan(root, jobs, output)
     statuses = _read_retry_report(root, report, {job["name"] for job in jobs})
     targets = [job["name"] for job in jobs
@@ -809,10 +886,12 @@ def run_retry(root, jobs, output, report):
     if not targets:
         return []
     selected = _select_jobs(jobs, targets)
-    return _run_selected(root, selected, deps_by_name, report_path)
+    execution = (_execution_for_run(root, jobs, output, "retry", report)
+                 if record_reasons else None)
+    return _run_selected(root, selected, deps_by_name, report_path, execution)
 
 
-def run_changes(root, jobs, output, changed_inputs):
+def run_changes(root, jobs, output, changed_inputs, record_reasons=False):
     """Execute the tasks affected by changed input files.
 
     Target selection mirrors ``preview_changes``: the tasks whose resolved
@@ -844,13 +923,29 @@ def run_changes(root, jobs, output, changed_inputs):
     ValueError before anything runs. Creating the output directory or
     writing the report may raise OSError after tasks have run; executed
     tasks are not undone.
+
+    With ``record_reasons=True`` and at least one target, the written
+    report additionally carries the top-level ``execution`` object with
+    ``mode`` ``"changes"``; ``targets`` are the directly changed tasks
+    plus every downstream dependent (each once, in plan order, matched by
+    resolved path so argument order and aliases of the same file change
+    nothing) and ``jobs`` are exactly ``preview_changes``' entries —
+    including ``triggered_by`` — same names and order as ``results``.
+    Reasons are chosen before execution and are never rewritten by this
+    run's outcomes. With no match nothing is written and no
+    ``execution`` is recorded. ``record_reasons`` must be a bool; other
+    values raise ValueError.
     """
+    _require_bool(record_reasons)
     deps_by_name, report_path = _validate_plan(root, jobs, output)
     _hits, targets = _changed_targets(root, jobs, deps_by_name, changed_inputs)
     if not targets:
         return []
     selected = _select_jobs(jobs, targets)
-    return _run_selected(root, selected, deps_by_name, report_path)
+    execution = (_execution_for_run(root, jobs, output, "changes", None,
+                                    changed_inputs=changed_inputs)
+                 if record_reasons else None)
+    return _run_selected(root, selected, deps_by_name, report_path, execution)
 
 
 def main():
@@ -876,8 +971,15 @@ def main():
                         help="preview tasks affected by changed input PATH (repeatable), read-only")
     parser.add_argument("--run-changed", action="append", default=None, metavar="PATH",
                         help="run tasks affected by changed input PATH (repeatable)")
+    parser.add_argument("--record-reasons", action="store_true",
+                        help="record why this run happened in the report's execution object")
     args = parser.parse_args()
     try:
+        if args.record_reasons and (args.preview or args.retry_preview is not None
+                                    or args.changed is not None or args.compare is not None
+                                    or args.explain is not None or args.history is not None):
+            raise ValueError("--record-reasons cannot be combined with --preview, "
+                             "--retry-preview, --changed, --compare, --explain or --history")
         if args.run_changed is not None and (args.only is not None or args.preview
                                              or args.retry_preview is not None
                                              or args.retry is not None
@@ -952,11 +1054,14 @@ def main():
                              ensure_ascii=False, indent=2))
             return 0
         if args.retry is not None:
-            results = run_retry(args.root, jobs, args.output, args.retry)
+            results = run_retry(args.root, jobs, args.output, args.retry,
+                                record_reasons=args.record_reasons)
         elif args.run_changed is not None:
-            results = run_changes(args.root, jobs, args.output, args.run_changed)
+            results = run_changes(args.root, jobs, args.output, args.run_changed,
+                                  record_reasons=args.record_reasons)
         else:
-            results = run_plan(args.root, jobs, args.output, targets=args.only)
+            results = run_plan(args.root, jobs, args.output, targets=args.only,
+                               record_reasons=args.record_reasons)
         summary = {"completed": sum(row["status"] == "completed" for row in results),
                    "failed": sum(row["status"] == "failed" for row in results)}
         declared_deps = {job["name"]: job.get("depends_on", []) for job in jobs}

@@ -2149,5 +2149,375 @@ class JobPlannerTests(unittest.TestCase):
         self.assertFalse((self.root / "should").exists())
 
 
+class RecordReasonsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "notes.txt").write_text("one\ntwo\n", encoding="utf-8")
+        (self.root / "sales.csv").write_text("item,count\nbook,2\npen,4\n", encoding="utf-8")
+
+    def _write_report(self, relative, payload):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def _jobs(self):
+        return [
+            {"name": "final", "operation": "sha256", "input": "notes.txt",
+             "depends_on": ["mid", "indirect"]},
+            {"name": "mid", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["base"]},
+            {"name": "indirect", "operation": "csv-summary", "input": "sales.csv",
+             "depends_on": ["base"]},
+            {"name": "base", "operation": "sha256", "input": "notes.txt"},
+            {"name": "broken", "operation": "shell", "input": "notes.txt"},
+            {"name": "down", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["broken"]},
+        ]
+
+    def _change_jobs(self):
+        return [
+            {"name": "alpha", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "beta", "operation": "sha256", "input": "data.bin",
+             "depends_on": ["alpha", "gamma"]},
+            {"name": "gamma", "operation": "csv-summary", "input": "sales.csv"},
+            {"name": "delta", "operation": "count-lines", "input": "sales.csv",
+             "depends_on": ["beta"]},
+            {"name": "unrelated", "operation": "count-lines", "input": "other.txt"},
+        ]
+
+    def test_default_off_keeps_report_and_return_unchanged(self):
+        jobs = self._jobs()
+        result = run_plan(self.root, jobs, "r.json")
+        text = (self.root / "r.json").read_text()
+        self.assertEqual(text, json.dumps({"results": result}, ensure_ascii=False,
+                                          indent=2) + "\n")
+        self.assertEqual(set(json.loads(text)), {"results"})
+        # Explicit False is identical to omitting the option.
+        self.assertEqual(run_plan(self.root, jobs, "r2.json", record_reasons=False),
+                         result)
+        self.assertEqual((self.root / "r2.json").read_text(),
+                         (self.root / "r.json").read_text())
+
+    def test_all_mode_records_execution_aligned_with_preview_and_results(self):
+        jobs = self._jobs()
+        result = run_plan(self.root, jobs, "r.json", record_reasons=True)
+        doc = json.loads((self.root / "r.json").read_text())
+        self.assertEqual(set(doc), {"results", "execution"})
+        self.assertEqual(doc["results"], result)
+        execution = doc["execution"]
+        self.assertEqual(set(execution), {"mode", "targets", "jobs"})
+        self.assertEqual(execution["mode"], "all")
+        self.assertEqual(execution["targets"], [job["name"] for job in jobs])
+        preview = preview_plan(self.root, jobs, "r.json")
+        self.assertEqual(execution["jobs"], preview["jobs"])
+        self.assertTrue(all(job["reason"] == "all" and job["required_by"] == []
+                            for job in execution["jobs"]))
+        # Same names, same order as results; the shared prerequisite appears once.
+        self.assertEqual([job["name"] for job in execution["jobs"]],
+                         [row["name"] for row in result])
+        self.assertEqual(len(execution["jobs"]),
+                         len({job["name"] for job in execution["jobs"]}))
+
+    def test_only_mode_is_plan_ordered_even_when_every_job_is_selected(self):
+        jobs = self._jobs()
+        all_names = [job["name"] for job in jobs]
+        # Targets deliberately out of plan order and covering every job:
+        # the mode stays "only" and targets come back in plan order.
+        result = run_plan(self.root, jobs, "r.json",
+                          targets=list(reversed(all_names)), record_reasons=True)
+        execution = json.loads((self.root / "r.json").read_text())["execution"]
+        self.assertEqual(execution["mode"], "only")
+        self.assertEqual(execution["targets"], all_names)
+        preview = preview_plan(self.root, jobs, "r.json",
+                               targets=list(reversed(all_names)))
+        self.assertEqual(execution["jobs"], preview["jobs"])
+        self.assertEqual([job["name"] for job in execution["jobs"]],
+                         [row["name"] for row in result])
+
+    def test_only_mode_reasons_required_by_and_shared_prerequisite(self):
+        jobs = self._jobs()
+        run_plan(self.root, jobs, "r.json", targets=["final", "mid"],
+                 record_reasons=True)
+        execution = json.loads((self.root / "r.json").read_text())["execution"]
+        by_name = {job["name"]: job for job in execution["jobs"]}
+        self.assertEqual(execution["targets"], ["final", "mid"])
+        self.assertEqual([job["name"] for job in execution["jobs"]],
+                         ["base", "mid", "indirect", "final"])
+        self.assertEqual(by_name["base"]["reason"], "prerequisite")
+        self.assertEqual(by_name["base"]["required_by"], ["final", "mid"])
+        self.assertEqual(by_name["mid"]["reason"], "target")
+        self.assertEqual(by_name["final"]["reason"], "target")
+        self.assertEqual(by_name["indirect"]["reason"], "prerequisite")
+        # Swapping target argument order changes nothing.
+        run_plan(self.root, jobs, "r2.json", targets=["mid", "final"],
+                 record_reasons=True)
+        self.assertEqual(json.loads((self.root / "r2.json").read_text())["execution"],
+                         execution)
+
+    def test_failed_and_blocked_jobs_keep_their_selection_reasons(self):
+        jobs = [
+            {"name": "broken", "operation": "shell", "input": "notes.txt"},
+            {"name": "down", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["broken"]},
+            {"name": "ok", "operation": "count-lines", "input": "notes.txt"},
+        ]
+        result = run_plan(self.root, jobs, "r.json", targets=["down", "ok"],
+                          record_reasons=True)
+        self.assertEqual([row["status"] for row in result],
+                         ["failed", "blocked", "completed"])
+        execution = json.loads((self.root / "r.json").read_text())["execution"]
+        by_name = {job["name"]: job for job in execution["jobs"]}
+        # The blocked task is still an explicit target with its preview entry;
+        # the failing prerequisite stays a prerequisite, outcome or not.
+        self.assertEqual(by_name["down"]["reason"], "target")
+        self.assertEqual(by_name["down"]["required_by"], ["down"])
+        self.assertEqual(by_name["broken"]["reason"], "prerequisite")
+        self.assertEqual(by_name["broken"]["required_by"], ["down"])
+        self.assertNotIn("status", by_name["down"])
+        self.assertEqual([job["name"] for job in execution["jobs"]],
+                         [row["name"] for row in result])
+
+    def test_retry_mode_aligns_with_preview_retry(self):
+        jobs = self._jobs()
+        run_plan(self.root, jobs, "old.json")
+        result = run_retry(self.root, jobs, "new.json", "old.json",
+                           record_reasons=True)
+        execution = json.loads((self.root / "new.json").read_text())["execution"]
+        self.assertEqual(execution["mode"], "retry")
+        preview = preview_retry(self.root, jobs, "new.json", "old.json")
+        self.assertEqual(execution["targets"], preview["targets"])
+        self.assertEqual(execution["targets"], ["broken", "down"])
+        self.assertEqual(execution["jobs"], preview["jobs"])
+        self.assertEqual([job["name"] for job in execution["jobs"]],
+                         [row["name"] for row in result])
+        # The blocked task recorded this run still carries its target reason.
+        down_job = next(job for job in execution["jobs"] if job["name"] == "down")
+        self.assertEqual(down_job["reason"], "target")
+        # The old report keeps no execution object.
+        self.assertEqual(set(json.loads((self.root / "old.json").read_text())),
+                         {"results"})
+
+    def test_retry_report_equal_to_output_uses_pre_overwrite_content(self):
+        jobs = [
+            {"name": "broken", "operation": "shell", "input": "notes.txt"},
+            {"name": "down", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["broken"]},
+            {"name": "ok", "operation": "count-lines", "input": "notes.txt"},
+        ]
+        run_plan(self.root, jobs, "same.json")
+        before_preview = preview_retry(self.root, jobs, "same.json", "same.json")
+        result = run_retry(self.root, jobs, "same.json", "same.json",
+                           record_reasons=True)
+        doc = json.loads((self.root / "same.json").read_text())
+        self.assertEqual(doc["execution"]["mode"], "retry")
+        self.assertEqual(doc["execution"]["targets"], before_preview["targets"])
+        self.assertEqual(doc["execution"]["jobs"], before_preview["jobs"])
+        self.assertEqual([job["name"] for job in doc["execution"]["jobs"]],
+                         [row["name"] for row in result])
+
+    def test_changes_mode_aligns_with_preview_changes(self):
+        (self.root / "data.bin").write_bytes(b"\x00\x01")
+        jobs = self._change_jobs()
+        result = run_changes(self.root, jobs, "r.json", ["notes.txt"],
+                             record_reasons=True)
+        execution = json.loads((self.root / "r.json").read_text())["execution"]
+        self.assertEqual(execution["mode"], "changes")
+        preview = preview_changes(self.root, jobs, "r.json", ["notes.txt"])
+        self.assertEqual(execution["targets"], preview["targets"])
+        self.assertEqual(execution["jobs"], preview["jobs"])
+        self.assertEqual([job["name"] for job in execution["jobs"]],
+                         [row["name"] for row in result])
+        by_name = {job["name"]: job for job in execution["jobs"]}
+        self.assertEqual(by_name["alpha"]["triggered_by"], ["alpha"])
+        self.assertEqual(by_name["gamma"]["triggered_by"], [])
+
+    def test_changes_mode_target_order_and_path_aliases_change_nothing(self):
+        (self.root / "data.bin").write_bytes(b"\x00\x01")
+        jobs = self._change_jobs()
+        first = run_changes(self.root, jobs, "a.json", ["notes.txt", "sales.csv"],
+                            record_reasons=True)
+        first_exec = json.loads((self.root / "a.json").read_text())["execution"]
+        self.assertEqual(first_exec["targets"],
+                         ["alpha", "beta", "gamma", "delta"])
+        for paths in (["sales.csv", "notes.txt"],
+                      ["./notes.txt", "notes.txt", "sub/../sales.csv"]):
+            result = run_changes(self.root, jobs, "b.json", paths,
+                                 record_reasons=True)
+            doc = json.loads((self.root / "b.json").read_text())
+            self.assertEqual(result, first)
+            self.assertEqual(doc["execution"], first_exec)
+
+    def test_empty_retry_and_changes_scopes_write_nothing_even_with_flag(self):
+        jobs = self._jobs()
+        self._write_report("empty.json", {"results": []})
+        before = {p.name for p in self.root.iterdir()}
+        self.assertEqual(run_retry(self.root, jobs, "deep/new.json", "empty.json",
+                                   record_reasons=True), [])
+        self.assertFalse((self.root / "deep").exists())
+        self.assertEqual({p.name for p in self.root.iterdir()}, before)
+        self.assertEqual(run_changes(self.root, jobs, "deep/new.json", ["nope.txt"],
+                                     record_reasons=True), [])
+        self.assertFalse((self.root / "deep").exists())
+        self.assertEqual({p.name for p in self.root.iterdir()}, before)
+        # An existing report is left byte-for-byte untouched.
+        marker = self._write_report("keep.json", {"results": [{"name": "kept"}]})
+        marker_text = marker.read_text()
+        self.assertEqual(run_changes(self.root, jobs, "keep.json", [],
+                                     record_reasons=True), [])
+        self.assertEqual(marker.read_text(), marker_text)
+
+    def test_non_bool_record_reasons_raises_value_error(self):
+        jobs = self._jobs()
+        run_plan(self.root, jobs, "old.json")
+        for bad in (0, 1, "true", "false", None, [], {}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    run_plan(self.root, jobs, "x.json", record_reasons=bad)
+                with self.assertRaises(ValueError):
+                    run_retry(self.root, jobs, "x.json", "old.json",
+                              record_reasons=bad)
+                with self.assertRaises(ValueError):
+                    run_changes(self.root, jobs, "x.json", ["notes.txt"],
+                                record_reasons=bad)
+        self.assertFalse((self.root / "x.json").exists())
+
+    def test_invalid_plan_or_targets_still_raise_with_flag_and_write_nothing(self):
+        jobs = self._jobs()
+        with self.assertRaises(ValueError):
+            run_plan(self.root, jobs, "r.json", targets=["ghost"],
+                     record_reasons=True)
+        bad = jobs + [{"name": "stray", "operation": "count-lines",
+                       "input": "../outside.txt"}]
+        with self.assertRaises(ValueError):
+            run_plan(self.root, bad, "r.json", record_reasons=True)
+        with self.assertRaises(ValueError):
+            run_changes(self.root, bad, "r.json", [], record_reasons=True)
+        self.assertFalse((self.root / "r.json").exists())
+
+    def test_report_readers_treat_execution_as_an_extra_field(self):
+        from job_planner import compare_reports, explain_report, query_history
+        jobs = [
+            {"name": "broken", "operation": "shell", "input": "notes.txt"},
+            {"name": "down", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["broken"]},
+            {"name": "ok", "operation": "count-lines", "input": "notes.txt"},
+        ]
+        run_plan(self.root, jobs, "r.json", record_reasons=True)
+        # Every read-only entry point handles the execution-bearing report
+        # exactly as before.
+        compared = compare_reports(self.root, jobs, "out.json", "r.json", "r.json")
+        self.assertTrue(all(row["change"] == "unchanged" for row in compared["jobs"]))
+        explained = explain_report(self.root, jobs, "out.json", "r.json")
+        self.assertEqual([row["name"] for row in explained["jobs"]],
+                         ["broken", "down"])
+        history = query_history(self.root, jobs, "out.json", ["r.json"])
+        self.assertEqual([row["name"] for row in history["jobs"]],
+                         ["broken", "down", "ok"])
+        retry = preview_retry(self.root, jobs, "out.json", "r.json")
+        self.assertEqual(retry["targets"], ["broken", "down"])
+        # A retry without the flag strips execution back out of the new report.
+        run_retry(self.root, jobs, "r2.json", "r.json")
+        self.assertEqual(set(json.loads((self.root / "r2.json").read_text())),
+                         {"results"})
+
+    def test_recorded_execution_is_deterministic(self):
+        jobs = self._jobs()
+        run_plan(self.root, jobs, "a.json", targets=["final"], record_reasons=True)
+        run_plan(self.root, jobs, "b.json", targets=["final"], record_reasons=True)
+        exec_a = json.loads((self.root / "a.json").read_text())["execution"]
+        exec_b = json.loads((self.root / "b.json").read_text())["execution"]
+        self.assertEqual(exec_a, exec_b)
+
+    def test_cli_record_reasons_flag_all_modes(self):
+        jobs = self._jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        run = subprocess.run(prefix + ["--output", "all.json", "--record-reasons"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertEqual(json.loads(run.stdout),
+                         {"completed": 4, "failed": 1, "blocked": 1})
+        doc = json.loads((self.root / "all.json").read_text())
+        self.assertEqual(doc["execution"]["mode"], "all")
+        self.assertEqual(doc["execution"]["targets"],
+                         [job["name"] for job in jobs])
+        # --only keeps the normal summary while recording mode "only".
+        run = subprocess.run(prefix + ["--output", "only.json",
+                                       "--only", "final", "--record-reasons"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout),
+                         {"completed": 4, "failed": 0, "blocked": 0})
+        doc = json.loads((self.root / "only.json").read_text())
+        self.assertEqual(doc["execution"]["mode"], "only")
+        self.assertEqual(doc["execution"]["targets"], ["final"])
+        # Retry mode.
+        run = subprocess.run(prefix + ["--retry", "all.json", "--output",
+                                       "retry.json", "--record-reasons"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertEqual(json.loads((self.root / "retry.json").read_text())
+                         ["execution"]["mode"], "retry")
+        # Change mode.
+        run = subprocess.run(prefix + ["--run-changed", "notes.txt", "--output",
+                                       "chg.json", "--record-reasons"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertEqual(json.loads((self.root / "chg.json").read_text())
+                         ["execution"]["mode"], "changes")
+        # Without the flag none of these reports carry execution.
+        run = subprocess.run(prefix + ["--output", "plain.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(set(json.loads((self.root / "plain.json").read_text())),
+                         {"results"})
+
+    def test_cli_record_reasons_conflicts_exit_2_error_only(self):
+        jobs = self._jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        self._write_report("r.json", {"results": []})
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        marker = self._write_report("keep.json", {"results": []})
+        marker_text = marker.read_text()
+        for extra in (["--record-reasons", "--preview"],
+                      ["--record-reasons", "--retry-preview", "r.json"],
+                      ["--record-reasons", "--changed", "notes.txt"],
+                      ["--record-reasons", "--compare", "r.json", "r.json"],
+                      ["--record-reasons", "--explain", "r.json"],
+                      ["--record-reasons", "--history", "r.json"],
+                      ["--preview", "--record-reasons"],
+                      ["--compare", "r.json", "r.json", "--record-reasons"]):
+            with self.subTest(extra=extra):
+                run = subprocess.run(prefix + extra, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self.assertEqual(marker.read_text(), marker_text)
+
+    def test_cli_record_reasons_empty_scopes_output_zeroes_and_touch_nothing(self):
+        jobs = self._jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        self._write_report("empty.json", {"results": []})
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        run = subprocess.run(prefix + ["--retry", "empty.json", "--record-reasons"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), {"completed": 0, "failed": 0})
+        self.assertFalse((self.root / ".results").exists())
+        run = subprocess.run(prefix + ["--run-changed", "nope.txt",
+                                       "--record-reasons"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), {"completed": 0, "failed": 0})
+        self.assertFalse((self.root / ".results").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
