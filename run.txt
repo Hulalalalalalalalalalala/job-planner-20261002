@@ -23,7 +23,17 @@ Prints the jobs that would run, in run order, with depends_on, reason
 (target/prerequisite, or all without --only) and required_by; exits 0 and runs
 nothing. The whole plan is still validated; failures exit 2 with an error JSON.
 
+Retry preview
+python3 job_planner.py samples/plan-dependencies.json --retry-preview .results/deps.json --output .results/deps.json
+Reads the named report and prints {"targets": [...], "jobs": [...]}: targets are
+the report's failed/blocked tasks in plan order and jobs cover them plus every
+prerequisite (shared once), in run order, with the same fields as --preview.
+Reports may be partial and report may equal --output. Empty results or no
+failures print {"targets": [], "jobs": []}. Nothing runs or is written; a bad,
+missing or escaping report path exits 2 with an error JSON. Cannot combine with
+--preview or --only.
+
 Smoke Test
 python3 -B -m unittest -v
 Checks real file operations, recorded errors, directory boundaries, symlinks,
-dependency validation/blocking and the CLI.
+dependency validation/blocking, plan and retry previews and the CLI.

@@ -140,19 +140,15 @@ def _run_order(selected, deps_by_name):
     return ordered
 
 
-def preview_plan(root, jobs, output, targets=None):
-    """Describe what run_plan would do, without executing or touching files.
+def _preview_entries(jobs, deps_by_name, targets):
+    """Build run-ordered preview entries for targets plus every prerequisite.
 
-    Validates the whole plan exactly like a run, then returns
-    ``{"jobs": [...]}`` covering the targets and every prerequisite, each
-    once, in run processing order. Jobs carry name, depends_on (declaration
-    order, [] when absent), reason ("all" without targets, otherwise
-    "target"/"prerequisite") and required_by (explicit targets needing the
-    job, in original plan order). Inputs are never read and no report is
-    written, so missing files, unknown operations and bad file contents do
-    not fail a preview; validation failures still raise ValueError.
+    ``targets=None`` describes the whole plan with reason ``"all"``;
+    otherwise explicit targets are ``"target"`` and every other included
+    job is ``"prerequisite"``. Shared prerequisites appear once and
+    required_by lists are walked in plan order, independently of target
+    argument order.
     """
-    deps_by_name, _report_path = _validate_plan(root, jobs, output)
     selected = _select_jobs(jobs, targets)
     ordered = _run_order(selected, deps_by_name)
     explicit = set(targets) if targets is not None else set()
@@ -173,13 +169,93 @@ def preview_plan(root, jobs, output, targets=None):
                 seen.add(node)
                 required_by[node].append(target)
                 stack.extend(deps_by_name[node])
-    return {"jobs": [
+    return [
         {"name": name,
          "depends_on": list(deps_by_name[name]),
          "reason": "all" if targets is None else ("target" if name in explicit else "prerequisite"),
          "required_by": required_by[name]}
         for name in ordered
-    ]}
+    ]
+
+
+def _read_retry_report(root, report, names):
+    """Read and validate a historical run report; return {name: status}.
+
+    Only the report file is read. The path must be relative to root and,
+    after resolving symlinks, stay inside root. The report must be a UTF-8
+    JSON object whose results list has object entries with names matching
+    the current plan exactly, no repeats, and one of the three statuses;
+    other fields are ignored. Any violation raises ValueError.
+    """
+    path = local_path(root, report)
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"report {report!r} is missing or unreadable") from exc
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"report {report!r} is not valid UTF-8") from exc
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise ValueError(f"report {report!r} is not valid JSON") from exc
+    if not isinstance(data, dict):
+        raise ValueError("report must be a JSON object")
+    results = data.get("results")
+    if not isinstance(results, list):
+        raise ValueError("report results must be a list")
+    statuses = {}
+    for entry in results:
+        if not isinstance(entry, dict):
+            raise ValueError("each report result must be a JSON object")
+        name = entry.get("name")
+        if not isinstance(name, str) or name not in names:
+            raise ValueError(f"report contains unknown task {name!r}")
+        if name in statuses:
+            raise ValueError(f"report repeats task {name!r}")
+        status = entry.get("status")
+        if status not in ("completed", "failed", "blocked"):
+            raise ValueError(f"report task {name!r} has invalid status {status!r}")
+        statuses[name] = status
+    return statuses
+
+
+def preview_plan(root, jobs, output, targets=None):
+    """Describe what run_plan would do, without executing or touching files.
+
+    Validates the whole plan exactly like a run, then returns
+    ``{"jobs": [...]}`` covering the targets and every prerequisite, each
+    once, in run processing order. Jobs carry name, depends_on (declaration
+    order, [] when absent), reason ("all" without targets, otherwise
+    "target"/"prerequisite") and required_by (explicit targets needing the
+    job, in original plan order). Inputs are never read and no report is
+    written, so missing files, unknown operations and bad file contents do
+    not fail a preview; validation failures still raise ValueError.
+    """
+    deps_by_name, _report_path = _validate_plan(root, jobs, output)
+    return {"jobs": _preview_entries(jobs, deps_by_name, targets)}
+
+
+def preview_retry(root, jobs, output, report):
+    """Preview a retry from a historical run report, without touching files.
+
+    Tasks recorded as ``failed`` or ``blocked`` in the report become the
+    retry targets; the returned jobs cover those targets and every
+    prerequisite (including prerequisites the report marked completed,
+    since a manual rerun reprocesses them), in plan run order with the
+    same fields as ``preview_plan`` with targets. The report may cover a
+    partial run: unrecorded tasks join the preview only when they are
+    required prerequisites. Nothing is executed or written and job inputs
+    are never read; only the plan and the named report are read.
+    """
+    deps_by_name, _report_path = _validate_plan(root, jobs, output)
+    statuses = _read_retry_report(root, report, {job["name"] for job in jobs})
+    targets = [job["name"] for job in jobs
+               if statuses.get(job["name"]) in ("failed", "blocked")]
+    if not targets:
+        return {"targets": [], "jobs": []}
+    return {"targets": targets, "jobs": _preview_entries(jobs, deps_by_name, targets)}
 
 
 def run_plan(root, jobs, output, targets=None):
@@ -220,12 +296,20 @@ def main():
                         help="run only this job and its prerequisites (repeatable)")
     parser.add_argument("--preview", action="store_true",
                         help="print the jobs that would run with reasons, then exit 0")
+    parser.add_argument("--retry-preview", metavar="REPORT",
+                        help="print targets and jobs a retry of REPORT would run, then exit 0")
     args = parser.parse_args()
     try:
+        if args.retry_preview is not None and (args.preview or args.only is not None):
+            raise ValueError("--retry-preview cannot be combined with --preview or --only")
         plan = local_path(args.root, args.plan)
         if plan == local_path(args.root, args.output):
             raise ValueError("report cannot overwrite its plan")
         jobs = json.loads(plan.read_text(encoding="utf-8"))["jobs"]
+        if args.retry_preview is not None:
+            print(json.dumps(preview_retry(args.root, jobs, args.output, args.retry_preview),
+                             ensure_ascii=False, indent=2))
+            return 0
         if args.preview:
             print(json.dumps(preview_plan(args.root, jobs, args.output, targets=args.only),
                              ensure_ascii=False, indent=2))
