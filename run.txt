@@ -52,11 +52,19 @@ entry per task recorded in either report in plan order, each with name,
 before, after (null on the missing side; otherwise just status plus
 result/error/blocked_by) and change: added, removed, changed or unchanged.
 Status or payload differences count (including error text); result compares
-as JSON (true is not 1, object key order is ignored, array order matters) and
-blocked_by compares as a set and prints in current dependency order. Both
-paths may be the same file. A valid comparison exits 0 even with failed
-records; bad reports/payloads, escaping paths or a bad plan exit 2 with an
-error JSON. Nothing is created or written. Cannot combine with --only,
+as JSON (true is not 1, a number is not the same digits in a string,
+object key order is ignored, array order matters) and numbers nested in
+result compare by their exact decimal value without float precision loss
+(1, 1.0 and 1e0 are equal, as are 1e400 and 10e399 and -0 and 0, while
+0.10000000000000001 vs 0.1, 9007199254740992.0 vs 9007199254740993.0,
+1e400 vs 2e400 and 1e-400 vs 0 differ); both sides keep the original
+numeric value as a JSON number and blocked_by compares as a set and
+prints in current dependency order. Both paths may be the same file.
+A valid comparison exits 0 even with failed records; bad reports/
+payloads, escaping paths or a bad plan exit 2 with an error JSON —
+NaN, Infinity and -Infinity reject a report even in ignored extra
+fields, though long decimals and legal exponents beyond float range are
+fine. Nothing is created or written. Cannot combine with --only,
 --preview, --retry-preview or --retry.
 
 Explain
