@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from job_planner import (compare_reports, execute_job, explain_report, local_path,
                          preview_changes, preview_plan, preview_retry, query_history,
-                         run_plan, run_retry)
+                         run_changes, run_plan, run_retry)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -544,6 +544,167 @@ class JobPlannerTests(unittest.TestCase):
                 self.assertEqual(run.returncode, 2, run.stderr)
                 self.assertIn("error", json.loads(run.stdout))
 
+
+    def test_run_changes_scope_order_and_report_match_preview(self):
+        (self.root / "data.bin").write_bytes(b"\x00\x01")
+        jobs = self._changes_jobs()
+        result = run_changes(self.root, jobs, "results/report.json", ["notes.txt"])
+        # Same scope and processing order as the preview for the same input;
+        # the unrelated branch is neither read nor recorded.
+        preview = preview_changes(self.root, jobs, "results/report.json", ["notes.txt"])
+        self.assertEqual([row["name"] for row in result],
+                         [row["name"] for row in preview["jobs"]])
+        self.assertEqual([row["name"] for row in result],
+                         ["alpha", "gamma", "beta", "delta"])
+        self.assertTrue(all(row["status"] == "completed" for row in result))
+        report = json.loads((self.root / "results/report.json").read_text())["results"]
+        self.assertEqual(report, result)
+        # A narrower rerun replaces the old report content entirely.
+        result = run_changes(self.root, jobs, "results/report.json", ["data.bin"])
+        self.assertEqual([row["name"] for row in result], ["alpha", "gamma", "beta", "delta"])
+        result = run_changes(self.root, jobs, "results/report.json", ["sales.csv"])
+        self.assertEqual([row["name"] for row in result],
+                         ["alpha", "gamma", "beta", "delta"])
+        report = json.loads((self.root / "results/report.json").read_text())["results"]
+        self.assertEqual(report, result)
+
+    def test_run_changes_merges_paths_and_ignores_order(self):
+        (self.root / "data.bin").write_bytes(b"\x00\x01")
+        jobs = self._changes_jobs()
+        expected = run_changes(self.root, jobs, "results/a.json",
+                               ["notes.txt", "sales.csv"])
+        self.assertEqual([row["name"] for row in expected],
+                         ["alpha", "gamma", "beta", "delta"])
+        # Argument order, repeats and aliases of the same file change nothing.
+        self.assertEqual(run_changes(self.root, jobs, "results/b.json",
+                                     ["sales.csv", "notes.txt"]), expected)
+        self.assertEqual(run_changes(self.root, jobs, "results/b.json",
+                                     ["./notes.txt", "notes.txt", "sub/../sales.csv"]),
+                         expected)
+
+    def test_run_changes_failure_blocks_downstream_independent_continues(self):
+        jobs = [
+            {"name": "broken", "operation": "shell", "input": "notes.txt"},
+            {"name": "stray", "operation": "count-lines", "input": "missing.txt",
+             "depends_on": ["broken"]},
+            {"name": "joiner", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["broken", "healthy"]},
+            {"name": "healthy", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "unrelated", "operation": "count-lines", "input": "other.txt"},
+        ]
+        result = run_changes(self.root, jobs, "results/report.json", ["notes.txt"])
+        self.assertEqual([row["name"] for row in result],
+                         ["broken", "stray", "healthy", "joiner"])
+        by_name = {row["name"]: row for row in result}
+        self.assertEqual(by_name["broken"]["status"], "failed")
+        self.assertIn("error", by_name["broken"])
+        self.assertEqual(by_name["healthy"]["status"], "completed")
+        # Blocked tasks never read their input: stray's missing file stays
+        # unread and blocked_by keeps declaration order.
+        self.assertEqual(by_name["stray"],
+                         {"name": "stray", "status": "blocked", "blocked_by": ["broken"]})
+        self.assertEqual(by_name["joiner"],
+                         {"name": "joiner", "status": "blocked", "blocked_by": ["broken"]})
+        # The unrelated branch is out of scope: no record, no read.
+        self.assertNotIn("unrelated", by_name)
+
+    def test_run_changes_empty_or_unmatched_runs_nothing(self):
+        jobs = [{"name": "ghost", "operation": "count-lines", "input": "nope.txt"}]
+        for changed in ([], ["missing.txt"], ["deep/none.txt"]):
+            before = {p.name for p in self.root.iterdir()}
+            self.assertEqual(run_changes(self.root, jobs, "deep/new/out.json", changed), [])
+            self.assertFalse((self.root / "deep").exists())
+            self.assertEqual({p.name for p in self.root.iterdir()}, before)
+        # An existing output file is left exactly as it was.
+        marker = self._write_report("keep.json", {"results": [{"name": "kept"}]})
+        before = marker.read_text()
+        self.assertEqual(run_changes(self.root, jobs, "keep.json", []), [])
+        self.assertEqual(marker.read_text(), before)
+
+    def test_run_changes_invalid_inputs_and_whole_plan_validated(self):
+        jobs = self._changes_jobs()
+        for changed in ("notes.txt", [1], ["  "], [""], [str(ROOT / "README.md")],
+                        ["../outside.txt"], ["notes.txt", "../outside.txt"]):
+            with self.subTest(changed=changed):
+                with self.assertRaises(ValueError):
+                    run_changes(self.root, jobs, "results/report.json", changed)
+        (self.root / "escape").symlink_to(ROOT / "README.md")
+        with self.assertRaises(ValueError):
+            run_changes(self.root, jobs, "results/report.json", ["escape"])
+        # The whole plan and output are validated even when nothing matches.
+        bad_jobs = jobs + [{"name": "stray", "operation": "count-lines",
+                            "input": "../outside.txt"}]
+        with self.assertRaises(ValueError):
+            run_changes(self.root, bad_jobs, "results/report.json", [])
+        bad_dep = jobs + [{"name": "stray", "operation": "count-lines",
+                           "input": "notes.txt", "depends_on": ["ghost"]}]
+        with self.assertRaises(ValueError):
+            run_changes(self.root, bad_dep, "results/report.json", [])
+        with self.assertRaises(ValueError):
+            run_changes(self.root, jobs, "notes.txt", [])
+        self.assertFalse((self.root / "results").exists())
+
+    def test_run_changes_output_write_failure_raises_oserror_after_running(self):
+        jobs = [{"name": "notes", "operation": "count-lines", "input": "notes.txt"}]
+        (self.root / "blocker").write_text("x", encoding="utf-8")
+        with self.assertRaises(OSError):
+            run_changes(self.root, jobs, "blocker/out.json", ["notes.txt"])
+
+    def test_cli_run_changed_flag(self):
+        jobs = [
+            {"name": "broken", "operation": "shell", "input": "notes.txt"},
+            {"name": "downstream", "operation": "count-lines", "input": "missing.txt",
+             "depends_on": ["broken"]},
+            {"name": "healthy", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "unrelated", "operation": "count-lines", "input": "other.txt"},
+        ]
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        run = subprocess.run(prefix + ["--run-changed", "notes.txt",
+                                       "--output", "out.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertEqual(json.loads(run.stdout),
+                         {"completed": 1, "failed": 1, "blocked": 1})
+        report = json.loads((self.root / "out.json").read_text())["results"]
+        self.assertEqual([row["name"] for row in report],
+                         ["broken", "downstream", "healthy"])
+        # Repeated flags accumulate; a fully successful scope exits 0.
+        (self.root / "data.bin").write_bytes(b"\x00\x01")
+        plan.write_text(json.dumps({"jobs": self._changes_jobs()}))
+        run = subprocess.run(prefix + ["--run-changed", "notes.txt",
+                                       "--run-changed", "sales.csv",
+                                       "--output", "all.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout),
+                         {"completed": 4, "failed": 0, "blocked": 0})
+        # An unmatched change prints zeroes, exits 0 and touches nothing.
+        run = subprocess.run(prefix + ["--run-changed", "none.txt",
+                                       "--output", "deep/out.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), {"completed": 0, "failed": 0})
+        self.assertFalse((self.root / "deep").exists())
+        # Conflicts and validation failures print error-only JSON, exit 2
+        # and leave existing reports untouched.
+        marker = self._write_report("keep.json", {"results": []})
+        for extra in (["--run-changed", "notes.txt", "--only", "alpha"],
+                      ["--run-changed", "notes.txt", "--preview"],
+                      ["--run-changed", "notes.txt", "--retry-preview", "r.json"],
+                      ["--run-changed", "notes.txt", "--retry", "r.json"],
+                      ["--run-changed", "notes.txt", "--compare", "a.json", "b.json"],
+                      ["--run-changed", "notes.txt", "--explain", "r.json"],
+                      ["--run-changed", "notes.txt", "--history", "r.json"],
+                      ["--run-changed", "notes.txt", "--changed", "notes.txt"],
+                      ["--run-changed", "../outside.txt"]):
+            with self.subTest(extra=extra):
+                run = subprocess.run(prefix + extra, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self.assertEqual(marker.read_text(), json.dumps({"results": []}))
 
     def _write_report(self, relative, payload, raw=None):
         path = self.root / relative
