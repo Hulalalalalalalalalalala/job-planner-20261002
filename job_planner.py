@@ -258,9 +258,15 @@ def preview_retry(root, jobs, output, report):
     return {"targets": targets, "jobs": _preview_entries(jobs, deps_by_name, targets)}
 
 
-def run_plan(root, jobs, output, targets=None):
-    deps_by_name, report_path = _validate_plan(root, jobs, output)
-    selected = _select_jobs(jobs, targets)
+def _run_selected(root, selected, deps_by_name, report_path):
+    """Execute an already-selected plan-ordered job list and write its report.
+
+    Processing order, failure records and blocked propagation are shared by
+    every execution mode: each pass runs the earliest ready job, a failing
+    or blocked direct dependency blocks dependants without reading their
+    input, and only this run's results drive dependency decisions. The
+    report contains exactly these results, replacing any prior content.
+    """
     results = []
     records = {}
     pending = {job["name"] for job in selected}
@@ -287,6 +293,46 @@ def run_plan(root, jobs, output, targets=None):
     return results
 
 
+def run_plan(root, jobs, output, targets=None):
+    deps_by_name, report_path = _validate_plan(root, jobs, output)
+    selected = _select_jobs(jobs, targets)
+    return _run_selected(root, selected, deps_by_name, report_path)
+
+
+def run_retry(root, jobs, output, report):
+    """Execute a manual retry derived from a historical run report.
+
+    Target selection mirrors ``preview_retry``: every task the report
+    records as ``failed`` or ``blocked`` becomes a target in current plan
+    order, and the run covers the targets plus every direct and indirect
+    prerequisite — prerequisites the report marked ``completed`` are
+    re-executed too, and shared prerequisites run once. The report may
+    cover a partial run; unrecorded tasks join only when they are required
+    prerequisites and unrelated branches are neither read nor recorded.
+
+    With no retry targets the empty list is returned without reading task
+    inputs, creating directories or touching the report. Otherwise this
+    run's result list is returned and written to ``output`` only — old
+    records are never copied. ``report`` may equal ``output``; targets are
+    taken from the content read before the overwrite. Execution order,
+    failure records and ``blocked_by`` propagation are exactly
+    ``run_plan``'s, driven solely by this run's results.
+
+    The whole plan (including unselected branches and an empty scope) and
+    the output path are validated first; report problems raise ValueError
+    exactly as in ``preview_retry``, and creating the output directory or
+    writing the report may raise OSError after tasks have run.
+    """
+    deps_by_name, report_path = _validate_plan(root, jobs, output)
+    statuses = _read_retry_report(root, report, {job["name"] for job in jobs})
+    targets = [job["name"] for job in jobs
+               if statuses.get(job["name"]) in ("failed", "blocked")]
+    if not targets:
+        return []
+    selected = _select_jobs(jobs, targets)
+    return _run_selected(root, selected, deps_by_name, report_path)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("plan")
@@ -298,10 +344,15 @@ def main():
                         help="print the jobs that would run with reasons, then exit 0")
     parser.add_argument("--retry-preview", metavar="REPORT",
                         help="print targets and jobs a retry of REPORT would run, then exit 0")
+    parser.add_argument("--retry", metavar="REPORT",
+                        help="rerun the report's failed/blocked tasks with their prerequisites")
     args = parser.parse_args()
     try:
         if args.retry_preview is not None and (args.preview or args.only is not None):
             raise ValueError("--retry-preview cannot be combined with --preview or --only")
+        if args.retry is not None and (args.preview or args.only is not None
+                                       or args.retry_preview is not None):
+            raise ValueError("--retry cannot be combined with --only, --preview or --retry-preview")
         plan = local_path(args.root, args.plan)
         if plan == local_path(args.root, args.output):
             raise ValueError("report cannot overwrite its plan")
@@ -314,10 +365,14 @@ def main():
             print(json.dumps(preview_plan(args.root, jobs, args.output, targets=args.only),
                              ensure_ascii=False, indent=2))
             return 0
-        results = run_plan(args.root, jobs, args.output, targets=args.only)
+        if args.retry is not None:
+            results = run_retry(args.root, jobs, args.output, args.retry)
+        else:
+            results = run_plan(args.root, jobs, args.output, targets=args.only)
         summary = {"completed": sum(row["status"] == "completed" for row in results),
                    "failed": sum(row["status"] == "failed" for row in results)}
-        if any(job.get("depends_on") for job in _select_jobs(jobs, args.only)):
+        declared_deps = {job["name"]: job.get("depends_on", []) for job in jobs}
+        if any(declared_deps[row["name"]] for row in results):
             summary["blocked"] = sum(row["status"] == "blocked" for row in results)
         print(json.dumps(summary))
         return 1 if any(row["status"] in ("failed", "blocked") for row in results) else 0
