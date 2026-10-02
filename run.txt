@@ -137,6 +137,21 @@ boolean, and --record-reasons cannot be combined with --preview,
 JSON, exit 2). Existing readers ignore execution as an extra field and
 old reports need no changes.
 
+Execution query
+python3 job_planner.py samples/plan-dependencies.json --execution .results/deps.json --output .results/deps.json
+Prints {"execution": ...}: the report's recorded run reasons (mode,
+targets and jobs with depends_on/reason/required_by, plus triggered_by
+for changes runs) exactly as saved, every array in report order; failed
+or blocked results never rewrite them and the selection is never
+recomputed. Reports without an execution field (including empty
+results) print {"execution": null}. The plan and the report's results
+are validated like --compare, so partial reports are fine; a present
+execution must be a well-formed object consistent with the current plan
+and the report's results, or the query exits 2 with an error JSON.
+Nothing runs or is written and report may equal --output. Cannot
+combine with --only, --record-reasons or any other execution, preview
+or report-query option.
+
 Smoke Test
 python3 -B -m unittest -v
 Checks real file operations, recorded errors, directory boundaries, symlinks,

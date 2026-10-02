@@ -208,8 +208,8 @@ def _reject_json_constant(value):
     raise ValueError(f"invalid JSON constant {value}")
 
 
-def _load_report_entries(root, report, names, exact_numbers=False):
-    """Read a report file into its raw ``results`` entries.
+def _load_report_document(root, report, exact_numbers=False):
+    """Read a report file into its parsed JSON object.
 
     Only the report file is read. The path must be relative to root and,
     after resolving symlinks, stay inside root. The report must be a UTF-8
@@ -240,10 +240,18 @@ def _load_report_entries(root, report, names, exact_numbers=False):
         raise ValueError(f"report {report!r} is not valid JSON") from exc
     if not isinstance(data, dict):
         raise ValueError("report must be a JSON object")
-    results = data.get("results")
-    if not isinstance(results, list):
+    if not isinstance(data.get("results"), list):
         raise ValueError("report results must be a list")
-    return results
+    return data
+
+
+def _load_report_entries(root, report, names, exact_numbers=False):
+    """Read a report file into its raw ``results`` entries.
+
+    Same loading and top-level checks as ``_load_report_document``; only
+    the ``results`` list is returned.
+    """
+    return _load_report_document(root, report, exact_numbers=exact_numbers)["results"]
 
 
 def _read_retry_report(root, report, names):
@@ -270,8 +278,8 @@ def _read_retry_report(root, report, names):
     return statuses
 
 
-def _read_compare_report(root, report, deps_by_name, exact_numbers=False):
-    """Read and validate a report for comparison; return {name: side entry}.
+def _compare_records(results, deps_by_name):
+    """Validate raw ``results`` entries; return {name: side entry}.
 
     Structure, names, statuses and the repeat rule match the retry report,
     but every status must carry its matching payload: ``completed`` needs an
@@ -280,13 +288,8 @@ def _read_compare_report(root, report, deps_by_name, exact_numbers=False):
     dependencies. Extra entry fields are ignored. ``blocked_by`` is
     returned in current declaration order so callers compare it as a set
     independently of report record order. Any violation raises ValueError.
-
-    Only the compare and history entry points pass ``exact_numbers``:
-    then every JSON number is kept as ``Decimal`` and non-JSON numeric
-    constants are rejected, while explain keeps ordinary float parsing.
     """
     names = set(deps_by_name)
-    results = _load_report_entries(root, report, names, exact_numbers=exact_numbers)
     records = {}
     for entry in results:
         if not isinstance(entry, dict):
@@ -327,6 +330,20 @@ def _read_compare_report(root, report, deps_by_name, exact_numbers=False):
             ordered = [dep for dep in declared if dep in set(blocked_by)]
             records[name] = {"status": "blocked", "blocked_by": ordered}
     return records
+
+
+def _read_compare_report(root, report, deps_by_name, exact_numbers=False):
+    """Read and validate a report for comparison; return {name: side entry}.
+
+    Loads the report like every report reader and validates its entries
+    under ``_compare_records``'s rules. Only the compare and history entry
+    points pass ``exact_numbers``: then every JSON number is kept as
+    ``Decimal`` and non-JSON numeric constants are rejected, while explain
+    keeps ordinary float parsing.
+    """
+    results = _load_report_entries(root, report, set(deps_by_name),
+                                   exact_numbers=exact_numbers)
+    return _compare_records(results, deps_by_name)
 
 
 def _json_equal(a, b):
@@ -608,6 +625,143 @@ def query_history(root, jobs, output, reports, targets=None):
                    for report, records in zip(reports, report_records)]
         history_jobs.append({"name": name, "history": history})
     return {"jobs": history_jobs}
+
+
+def _validated_execution(execution, results, deps_by_name):
+    """Validate a recorded ``execution`` object; return its public fields.
+
+    The object must carry ``mode`` (``"all"``, ``"only"``, ``"retry"`` or
+    ``"changes"``), ``targets`` (a nonempty, duplicate-free list of known
+    task names; mode ``"all"`` must cover the whole plan) and ``jobs`` (a
+    nonempty list of objects whose names match the report's ``results``
+    in name and order and include every target). Each job must carry
+    ``depends_on`` equal to the current declaration, the ``reason`` its
+    target membership implies (``"all"`` for mode ``"all"``, whose
+    ``required_by`` must be empty; otherwise ``"target"`` or
+    ``"prerequisite"``), a duplicate-free ``required_by`` naming only
+    targets and, for mode ``"changes"``, a ``triggered_by`` under the same
+    rules. Only types, references and these correspondences are checked —
+    the recorded lists are kept verbatim and the historical selection is
+    never recomputed. Extra fields are ignored. Any violation raises
+    ValueError.
+    """
+    if not isinstance(execution, dict):
+        raise ValueError("report execution must be an object")
+    mode = execution.get("mode")
+    if mode not in ("all", "only", "retry", "changes"):
+        raise ValueError(f"report execution has invalid mode {mode!r}")
+    names = set(deps_by_name)
+    targets = execution.get("targets")
+    if (not isinstance(targets, list) or not targets
+            or any(not isinstance(target, str) for target in targets)
+            or len(set(targets)) != len(targets)):
+        raise ValueError(
+            "report execution targets must be a nonempty list of unique task names")
+    unknown = [target for target in targets if target not in names]
+    if unknown:
+        raise ValueError(f"report execution names unknown target {unknown[0]!r}")
+    if mode == "all" and set(targets) != names:
+        raise ValueError("report execution mode 'all' must target the whole plan")
+    exec_jobs = execution.get("jobs")
+    if not isinstance(exec_jobs, list) or not exec_jobs:
+        raise ValueError("report execution jobs must be a nonempty list")
+    if any(not isinstance(entry, dict) for entry in exec_jobs):
+        raise ValueError("each report execution job must be an object")
+    if [entry.get("name") for entry in exec_jobs] != [row["name"] for row in results]:
+        raise ValueError(
+            "report execution jobs must match the report results in name and order")
+    target_set = set(targets)
+    job_names = {entry["name"] for entry in exec_jobs}
+    if not target_set <= job_names:
+        raise ValueError("report execution jobs must include every target")
+    kept = []
+    for entry in exec_jobs:
+        name = entry["name"]
+        depends_on = entry.get("depends_on")
+        if depends_on != deps_by_name[name]:
+            raise ValueError(
+                f"report execution job {name!r}: depends_on differs from the "
+                "current declaration")
+        if mode == "all":
+            expected_reason = "all"
+        else:
+            expected_reason = "target" if name in target_set else "prerequisite"
+        reason = entry.get("reason")
+        if reason != expected_reason:
+            raise ValueError(
+                f"report execution job {name!r}: reason must be {expected_reason!r}")
+        required_by = entry.get("required_by")
+        if (not isinstance(required_by, list)
+                or any(not isinstance(target, str) for target in required_by)
+                or len(set(required_by)) != len(required_by)):
+            raise ValueError(
+                f"report execution job {name!r}: required_by must be a list of "
+                "unique task names")
+        if any(target not in target_set for target in required_by):
+            raise ValueError(
+                f"report execution job {name!r}: required_by names a non-target")
+        if mode == "all" and required_by:
+            raise ValueError(
+                f"report execution job {name!r}: mode 'all' requires an empty "
+                "required_by")
+        kept_entry = {"name": name, "depends_on": list(depends_on),
+                      "reason": reason, "required_by": list(required_by)}
+        if mode == "changes":
+            triggered_by = entry.get("triggered_by")
+            if (not isinstance(triggered_by, list)
+                    or any(not isinstance(hit, str) for hit in triggered_by)
+                    or len(set(triggered_by)) != len(triggered_by)):
+                raise ValueError(
+                    f"report execution job {name!r}: triggered_by must be a list "
+                    "of unique task names")
+            if any(hit not in target_set for hit in triggered_by):
+                raise ValueError(
+                    f"report execution job {name!r}: triggered_by names a non-target")
+            kept_entry["triggered_by"] = list(triggered_by)
+        kept.append(kept_entry)
+    return {"mode": mode, "targets": list(targets), "jobs": kept}
+
+
+def query_execution(root, jobs, output, report):
+    """Return a report's recorded execution reasons, read-only.
+
+    Returns ``{"execution": ...}``: the top-level ``execution`` object a
+    run with ``record_reasons=True`` wrote into the report, reduced to its
+    public fields — ``mode``, ``targets`` and ``jobs`` with ``name``,
+    ``depends_on``, ``reason``, ``required_by`` and, for mode
+    ``"changes"``, ``triggered_by`` — every array in the exact order the
+    report records it. Extra fields are ignored. A report without an
+    ``execution`` field, including one with empty ``results``, yields
+    ``{"execution": null}``. The recorded reasons are returned as saved:
+    failed or blocked results never rewrite them and the historical
+    selection is never recomputed.
+
+    The whole plan, every input path and the output path are validated
+    exactly like ``compare_reports`` (``report`` may equal ``output``),
+    and the report's ``results`` must satisfy the same strict payload
+    rules, so a partial report is valid. A present ``execution`` must be
+    an object whose ``mode`` is ``"all"``, ``"only"``, ``"retry"`` or
+    ``"changes"``, whose ``targets`` are a nonempty, duplicate-free list
+    of known task names (mode ``"all"`` covering the whole plan) and
+    whose ``jobs`` are a nonempty list of objects matching the report's
+    ``results`` in name and order and including every target; each job
+    must carry ``depends_on`` equal to the current declaration, the
+    ``reason`` its target membership implies (``"all"`` with an empty
+    ``required_by`` for mode ``"all"``, otherwise ``"target"`` or
+    ``"prerequisite"``), a duplicate-free ``required_by`` naming only
+    targets and, for mode ``"changes"``, a ``triggered_by`` under the
+    same rules. A missing field, wrong type, unknown reference, illegal
+    mode, mismatched correspondence or a ``null`` execution raises
+    ValueError. Nothing is executed, created or written and task inputs
+    are never read.
+    """
+    deps_by_name, _report_path = _validate_plan(root, jobs, output)
+    data = _load_report_document(root, report)
+    _compare_records(data["results"], deps_by_name)
+    if "execution" not in data:
+        return {"execution": None}
+    return {"execution": _validated_execution(data["execution"], data["results"],
+                                              deps_by_name)}
 
 
 def preview_plan(root, jobs, output, targets=None):
@@ -967,6 +1121,8 @@ def main():
                         help="explain read-only why the report's failed/blocked tasks did not pass")
     parser.add_argument("--history", action="append", default=None, metavar="REPORT",
                         help="show each task's record across REPORT (repeatable), read-only")
+    parser.add_argument("--execution", metavar="REPORT",
+                        help="print REPORT's recorded execution reasons, read-only")
     parser.add_argument("--changed", action="append", default=None, metavar="PATH",
                         help="preview tasks affected by changed input PATH (repeatable), read-only")
     parser.add_argument("--run-changed", action="append", default=None, metavar="PATH",
@@ -975,6 +1131,18 @@ def main():
                         help="record why this run happened in the report's execution object")
     args = parser.parse_args()
     try:
+        if args.execution is not None and (args.only is not None or args.preview
+                                           or args.retry_preview is not None
+                                           or args.retry is not None
+                                           or args.compare is not None
+                                           or args.explain is not None
+                                           or args.history is not None
+                                           or args.changed is not None
+                                           or args.run_changed is not None
+                                           or args.record_reasons):
+            raise ValueError("--execution cannot be combined with --only, --preview, "
+                             "--retry-preview, --retry, --compare, --explain, "
+                             "--history, --changed, --run-changed or --record-reasons")
         if args.record_reasons and (args.preview or args.retry_preview is not None
                                     or args.changed is not None or args.compare is not None
                                     or args.explain is not None or args.history is not None):
@@ -1031,6 +1199,11 @@ def main():
         jobs = json.loads(plan.read_text(encoding="utf-8"))["jobs"]
         if args.changed is not None:
             print(json.dumps(preview_changes(args.root, jobs, args.output, args.changed),
+                             ensure_ascii=False, indent=2))
+            return 0
+        if args.execution is not None:
+            print(json.dumps(query_execution(args.root, jobs, args.output,
+                                             args.execution),
                              ensure_ascii=False, indent=2))
             return 0
         if args.history is not None:
