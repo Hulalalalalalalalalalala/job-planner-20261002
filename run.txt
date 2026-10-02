@@ -84,6 +84,20 @@ reports, escaping paths or a bad plan exit 2 with an error JSON. Nothing is
 read besides the plan and report and nothing is created or written. Cannot
 combine with --only, --preview, --retry-preview, --retry or --compare.
 
+Change preview
+python3 job_planner.py samples/plan-dependencies.json --changed samples/notes.txt
+Prints {"targets": [...], "jobs": [...]} for the tasks whose resolved input
+path changed plus every downstream dependent (targets, in plan order) and
+those targets plus all prerequisites (jobs, in run order, with the --preview
+fields plus triggered_by: the directly changed tasks reaching each job, or
+[] for prerequisite-only jobs). Repeat --changed for more paths; paths
+resolve like plan inputs (absolute or escaping paths exit 2), need not
+exist and are never read, and duplicates or argument order change nothing.
+No match prints {"targets": [], "jobs": []} and still exits 0. The whole
+plan is validated first; failures exit 2 with an error JSON. Nothing runs
+or is written. Cannot combine with --only, --preview, --retry-preview,
+--retry, --compare, --explain or --history.
+
 Smoke Test
 python3 -B -m unittest -v
 Checks real file operations, recorded errors, directory boundaries, symlinks,

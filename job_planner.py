@@ -647,6 +647,75 @@ def preview_retry(root, jobs, output, report):
     return {"targets": targets, "jobs": _preview_entries(jobs, deps_by_name, targets)}
 
 
+def preview_changes(root, jobs, output, changed_inputs):
+    """Preview the tasks affected by changed input files, without touching files.
+
+    ``changed_inputs`` is a list of root-relative path strings (an empty
+    list is allowed); each is resolved like any plan path — absolute paths
+    and symlink escapes raise ValueError — and paths resolving to the same
+    file are merged, so argument order never changes the result. Matching
+    uses resolved paths only: files need not exist and are never read, and
+    a legal path matching no task input simply produces no targets.
+
+    Returns ``{"targets": [...], "jobs": [...]}``. Targets are the tasks
+    whose resolved input path was directly changed plus every task
+    downstream of them along declared dependencies, each once, in original
+    plan order. Jobs cover the targets and all their prerequisites, each
+    once, in the usual preview processing order with the same depends_on,
+    reason and required_by semantics as ``preview_plan`` with targets,
+    plus ``triggered_by``: the directly changed tasks that can reach the
+    job along dependency edges, in original plan order, including the job
+    itself when directly changed; jobs included only as prerequisites get
+    ``[]``. With no changed inputs or no matching task the result is
+    ``{"targets": [], "jobs": []}``.
+
+    The whole plan, every input path and the output path are validated
+    exactly like a run before the scope is chosen, even for an empty
+    result. Nothing is executed, created or written, no report is read and
+    task inputs are never read.
+    """
+    deps_by_name, _report_path = _validate_plan(root, jobs, output)
+    if not isinstance(changed_inputs, list):
+        raise ValueError("changed_inputs must be a list of paths")
+    if any(not isinstance(path, str) or not path.strip() for path in changed_inputs):
+        raise ValueError("changed inputs must be nonblank strings")
+    resolved = {local_path(root, path) for path in changed_inputs}
+    hits = [job["name"] for job in jobs
+            if local_path(root, job["input"]) in resolved]
+    if not hits:
+        return {"targets": [], "jobs": []}
+    dependents = {name: [] for name in deps_by_name}
+    for name, deps in deps_by_name.items():
+        for dep in deps:
+            dependents[dep].append(name)
+    affected = set(hits)
+    stack = list(hits)
+    while stack:
+        node = stack.pop()
+        for child in dependents[node]:
+            if child not in affected:
+                affected.add(child)
+                stack.append(child)
+    targets = [job["name"] for job in jobs if job["name"] in affected]
+    entries = _preview_entries(jobs, deps_by_name, targets)
+    # triggered_by: directly changed tasks reaching each target, plan order.
+    reachable = {name: set() for name in targets}
+    for hit in hits:
+        seen = set()
+        stack = [hit]
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            reachable[node].add(hit)
+            stack.extend(dependents[node])
+    for entry in entries:
+        entry["triggered_by"] = [hit for hit in hits
+                                 if hit in reachable.get(entry["name"], set())]
+    return {"targets": targets, "jobs": entries}
+
+
 def _run_selected(root, selected, deps_by_name, report_path):
     """Execute an already-selected plan-ordered job list and write its report.
 
@@ -741,8 +810,18 @@ def main():
                         help="explain read-only why the report's failed/blocked tasks did not pass")
     parser.add_argument("--history", action="append", default=None, metavar="REPORT",
                         help="show each task's record across REPORT (repeatable), read-only")
+    parser.add_argument("--changed", action="append", default=None, metavar="PATH",
+                        help="preview tasks affected by changed input PATH (repeatable), read-only")
     args = parser.parse_args()
     try:
+        if args.changed is not None and (args.only is not None or args.preview
+                                         or args.retry_preview is not None
+                                         or args.retry is not None
+                                         or args.compare is not None
+                                         or args.explain is not None
+                                         or args.history is not None):
+            raise ValueError("--changed cannot be combined with --only, --preview, "
+                             "--retry-preview, --retry, --compare, --explain or --history")
         if args.history is not None and (args.preview or args.retry_preview is not None
                                          or args.retry is not None
                                          or args.compare is not None
@@ -774,6 +853,10 @@ def main():
         if plan == local_path(args.root, args.output):
             raise ValueError("report cannot overwrite its plan")
         jobs = json.loads(plan.read_text(encoding="utf-8"))["jobs"]
+        if args.changed is not None:
+            print(json.dumps(preview_changes(args.root, jobs, args.output, args.changed),
+                             ensure_ascii=False, indent=2))
+            return 0
         if args.history is not None:
             print(_compare_dumps(query_history(args.root, jobs, args.output,
                                                args.history, targets=args.only)))

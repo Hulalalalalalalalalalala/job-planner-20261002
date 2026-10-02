@@ -5,8 +5,8 @@ import sys
 import tempfile
 import unittest
 from job_planner import (compare_reports, execute_job, explain_report, local_path,
-                         preview_plan, preview_retry, query_history, run_plan,
-                         run_retry)
+                         preview_changes, preview_plan, preview_retry, query_history,
+                         run_plan, run_retry)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -418,6 +418,131 @@ class JobPlannerTests(unittest.TestCase):
                              capture_output=True, text=True)
         self.assertEqual(run.returncode, 2, run.stderr)
         self.assertIn("error", json.loads(run.stdout))
+
+    def _changes_jobs(self):
+        return [
+            {"name": "alpha", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "beta", "operation": "sha256", "input": "data.bin",
+             "depends_on": ["alpha", "gamma"]},
+            {"name": "gamma", "operation": "csv-summary", "input": "sales.csv"},
+            {"name": "delta", "operation": "count-lines", "input": "sales.csv",
+             "depends_on": ["beta"]},
+            {"name": "unrelated", "operation": "count-lines", "input": "other.txt"},
+        ]
+
+    def test_changes_direct_hit_downstream_and_triggered_by(self):
+        # alpha's input changed; beta depends on alpha and the unchanged
+        # gamma, so the targets are alpha and beta (plus downstream delta)
+        # while gamma joins only as a prerequisite.
+        preview = preview_changes(self.root, self._changes_jobs(),
+                                  "results/report.json", ["notes.txt"])
+        self.assertEqual(preview["targets"], ["alpha", "beta", "delta"])
+        self.assertEqual([row["name"] for row in preview["jobs"]],
+                         ["alpha", "gamma", "beta", "delta"])
+        by_name = {row["name"]: row for row in preview["jobs"]}
+        self.assertEqual(by_name["alpha"]["triggered_by"], ["alpha"])
+        self.assertEqual(by_name["beta"]["triggered_by"], ["alpha"])
+        self.assertEqual(by_name["delta"]["triggered_by"], ["alpha"])
+        self.assertEqual(by_name["gamma"]["triggered_by"], [])
+        self.assertEqual(by_name["alpha"]["reason"], "target")
+        self.assertEqual(by_name["gamma"]["reason"], "prerequisite")
+        self.assertEqual(by_name["gamma"]["required_by"], ["beta", "delta"])
+        self.assertEqual(by_name["beta"]["depends_on"], ["alpha", "gamma"])
+
+    def test_changes_multiple_hits_merge_and_order_independent(self):
+        jobs = self._changes_jobs()
+        expected = preview_changes(self.root, jobs, "results/report.json",
+                                   ["notes.txt", "sales.csv"])
+        self.assertEqual(expected["targets"], ["alpha", "beta", "gamma", "delta"])
+        by_name = {row["name"]: row for row in expected["jobs"]}
+        self.assertEqual(by_name["beta"]["triggered_by"], ["alpha", "gamma"])
+        # delta's own input changed too, so it lists itself as well.
+        self.assertEqual(by_name["delta"]["triggered_by"], ["alpha", "gamma", "delta"])
+        # Argument order and paths resolving to the same file change nothing.
+        self.assertEqual(preview_changes(self.root, jobs, "results/report.json",
+                                         ["sales.csv", "notes.txt"]), expected)
+        self.assertEqual(preview_changes(self.root, jobs, "results/report.json",
+                                         ["./notes.txt", "notes.txt", "sub/../sales.csv"]),
+                         expected)
+
+    def test_changes_empty_or_unmatched_inputs_and_missing_files(self):
+        jobs = self._changes_jobs()
+        empty = {"targets": [], "jobs": []}
+        self.assertEqual(preview_changes(self.root, jobs, "results/report.json", []), empty)
+        # Legal paths matching no task input produce no targets; the files
+        # and even their directories need not exist.
+        self.assertEqual(preview_changes(self.root, jobs, "results/report.json",
+                                         ["missing.txt", "deep/none.txt"]), empty)
+        # Task inputs are matched by resolved path, never read.
+        self.assertEqual(preview_changes(self.root, jobs, "results/report.json",
+                                         ["data.bin"])["targets"], ["beta", "delta"])
+
+    def test_changes_invalid_inputs_raise_and_whole_plan_validated(self):
+        jobs = self._changes_jobs()
+        for changed in ("notes.txt", [1], ["  "], [""], [str(ROOT / "README.md")],
+                        ["../outside.txt"], ["notes.txt", "../outside.txt"]):
+            with self.subTest(changed=changed):
+                with self.assertRaises(ValueError):
+                    preview_changes(self.root, jobs, "results/report.json", changed)
+        (self.root / "escape").symlink_to(ROOT / "README.md")
+        with self.assertRaises(ValueError):
+            preview_changes(self.root, jobs, "results/report.json", ["escape"])
+        # The whole plan and output are validated even when nothing matches.
+        bad_jobs = jobs + [{"name": "stray", "operation": "count-lines",
+                            "input": "../outside.txt"}]
+        with self.assertRaises(ValueError):
+            preview_changes(self.root, bad_jobs, "results/report.json", [])
+        with self.assertRaises(ValueError):
+            preview_changes(self.root, jobs, "notes.txt", [])
+
+    def test_changes_is_read_only(self):
+        before = {p.name for p in self.root.iterdir()}
+        preview = preview_changes(self.root, self._changes_jobs(),
+                                  "results/new/deep/report.json", ["notes.txt"])
+        self.assertTrue(preview["targets"])
+        self.assertFalse((self.root / "results").exists())
+        self.assertEqual({p.name for p in self.root.iterdir()}, before)
+
+    def test_cli_changed_flag(self):
+        jobs = self._changes_jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        run = subprocess.run(prefix + ["--changed", "notes.txt"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        payload = json.loads(run.stdout)
+        self.assertEqual(payload["targets"], ["alpha", "beta", "delta"])
+        self.assertEqual([row["name"] for row in payload["jobs"]],
+                         ["alpha", "gamma", "beta", "delta"])
+        self.assertFalse((self.root / ".results").exists())
+        # Repeated flags accumulate and --root/--output are allowed.
+        run = subprocess.run(prefix + ["--changed", "notes.txt", "--changed", "sales.csv",
+                                       "--output", ".results/other.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout)["targets"],
+                         ["alpha", "beta", "gamma", "delta"])
+        self.assertFalse((self.root / ".results").exists())
+        # An unmatched change prints the empty object and still exits 0.
+        run = subprocess.run(prefix + ["--changed", "missing.txt"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), {"targets": [], "jobs": []})
+        # Conflicts and validation failures print error JSON and exit 2.
+        for extra in (["--changed", "notes.txt", "--only", "alpha"],
+                      ["--changed", "notes.txt", "--preview"],
+                      ["--changed", "notes.txt", "--retry-preview", "r.json"],
+                      ["--changed", "notes.txt", "--retry", "r.json"],
+                      ["--changed", "notes.txt", "--compare", "a.json", "b.json"],
+                      ["--changed", "notes.txt", "--explain", "r.json"],
+                      ["--changed", "notes.txt", "--history", "r.json"],
+                      ["--changed", "../outside.txt"]):
+            with self.subTest(extra=extra):
+                run = subprocess.run(prefix + extra, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                self.assertIn("error", json.loads(run.stdout))
 
 
     def _write_report(self, relative, payload, raw=None):
