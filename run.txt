@@ -98,8 +98,30 @@ plan is validated first; failures exit 2 with an error JSON. Nothing runs
 or is written. Cannot combine with --only, --preview, --retry-preview,
 --retry, --compare, --explain or --history.
 
+Run changes
+python3 job_planner.py samples/plan-dependencies.json --run-changed samples/notes.txt
+Executes exactly the scope --changed would preview for the same paths:
+the tasks whose resolved input changed, every downstream dependent, and
+all prerequisites of those targets (shared once). Repeat --run-changed
+for more paths; paths resolve like plan inputs (absolute or escaping
+paths exit 2), need not exist, and duplicates, aliases and argument
+order change nothing. Ordering, failures and blocked_by follow a normal
+run, judged on this run's results only; independent branches keep going.
+The report at --output holds just this run's records, replacing the old
+content; scope-out tasks are not read or recorded. Summary fields and
+the blocked field match a normal run; exit 0 when all complete, 1 on any
+failed or blocked task. Empty input or no match prints
+{"completed":0,"failed":0}, exits 0, reads no task inputs, creates no
+directories and leaves reports untouched. The whole plan and output are
+validated first (even for an empty scope); bad plans, paths or changed
+inputs exit 2 with an error JSON before anything runs, and output write
+failures exit 2 without undoing finished tasks. Cannot combine with
+--only, --preview, --retry-preview, --retry, --compare, --explain,
+--history or --changed.
+
 Smoke Test
 python3 -B -m unittest -v
 Checks real file operations, recorded errors, directory boundaries, symlinks,
 dependency validation/blocking, plan and retry previews, manual retries,
-report comparison, failure explanation and the CLI.
+changed-file previews and runs, report comparison, failure explanation and
+the CLI.

@@ -647,6 +647,43 @@ def preview_retry(root, jobs, output, report):
     return {"targets": targets, "jobs": _preview_entries(jobs, deps_by_name, targets)}
 
 
+def _changed_targets(root, jobs, deps_by_name, changed_inputs):
+    """Validate changed input paths; return ``(hits, targets)`` in plan order.
+
+    ``hits`` are the tasks whose resolved input path was named directly;
+    ``targets`` are the hits plus every task downstream of them along
+    declared dependencies. The whole plan must already be validated.
+    Paths use the same rules as plan inputs: ``changed_inputs`` must be a
+    list of nonblank strings, and absolute paths and symlink escapes raise
+    ValueError. Paths resolving to the same file merge and argument order
+    never changes the result; files need not exist and are never read, so
+    a legal path with no match gives ``([], [])``.
+    """
+    if not isinstance(changed_inputs, list):
+        raise ValueError("changed_inputs must be a list of paths")
+    if any(not isinstance(path, str) or not path.strip() for path in changed_inputs):
+        raise ValueError("changed inputs must be nonblank strings")
+    resolved = {local_path(root, path) for path in changed_inputs}
+    hits = [job["name"] for job in jobs
+            if local_path(root, job["input"]) in resolved]
+    if not hits:
+        return [], []
+    dependents = {name: [] for name in deps_by_name}
+    for name, deps in deps_by_name.items():
+        for dep in deps:
+            dependents[dep].append(name)
+    affected = set(hits)
+    stack = list(hits)
+    while stack:
+        node = stack.pop()
+        for child in dependents[node]:
+            if child not in affected:
+                affected.add(child)
+                stack.append(child)
+    targets = [job["name"] for job in jobs if job["name"] in affected]
+    return hits, targets
+
+
 def preview_changes(root, jobs, output, changed_inputs):
     """Preview the tasks affected by changed input files, without touching files.
 
@@ -675,30 +712,15 @@ def preview_changes(root, jobs, output, changed_inputs):
     task inputs are never read.
     """
     deps_by_name, _report_path = _validate_plan(root, jobs, output)
-    if not isinstance(changed_inputs, list):
-        raise ValueError("changed_inputs must be a list of paths")
-    if any(not isinstance(path, str) or not path.strip() for path in changed_inputs):
-        raise ValueError("changed inputs must be nonblank strings")
-    resolved = {local_path(root, path) for path in changed_inputs}
-    hits = [job["name"] for job in jobs
-            if local_path(root, job["input"]) in resolved]
-    if not hits:
+    hits, targets = _changed_targets(root, jobs, deps_by_name, changed_inputs)
+    if not targets:
         return {"targets": [], "jobs": []}
+    entries = _preview_entries(jobs, deps_by_name, targets)
+    # triggered_by: directly changed tasks reaching each target, plan order.
     dependents = {name: [] for name in deps_by_name}
     for name, deps in deps_by_name.items():
         for dep in deps:
             dependents[dep].append(name)
-    affected = set(hits)
-    stack = list(hits)
-    while stack:
-        node = stack.pop()
-        for child in dependents[node]:
-            if child not in affected:
-                affected.add(child)
-                stack.append(child)
-    targets = [job["name"] for job in jobs if job["name"] in affected]
-    entries = _preview_entries(jobs, deps_by_name, targets)
-    # triggered_by: directly changed tasks reaching each target, plan order.
     reachable = {name: set() for name in targets}
     for hit in hits:
         seen = set()
@@ -791,6 +813,44 @@ def run_retry(root, jobs, output, report):
     return _run_selected(root, selected, deps_by_name, report_path)
 
 
+def run_changes(root, jobs, output, changed_inputs):
+    """Execute the tasks affected by changed input files.
+
+    The scope is exactly the jobs ``preview_changes`` reports for the same
+    arguments: the tasks whose resolved input path was directly changed,
+    every task downstream of them, and every direct or indirect
+    prerequisite of those targets, shared prerequisites once. Paths are
+    validated and matched exactly as in ``preview_changes`` — repeats,
+    aliases and argument order change nothing, files need not exist, and a
+    legal path with no match produces no targets.
+
+    With no changed inputs or no matching task the empty list is returned
+    without reading task inputs, creating directories or touching the
+    report. Otherwise this run's result list is returned and written to
+    ``output`` only, replacing prior content; scope-out tasks are neither
+    read nor recorded. Execution order, failure records and ``blocked_by``
+    propagation are exactly ``run_plan``'s, driven solely by this run's
+    results: input read failures, unknown operations and bad contents are
+    recorded ``failed`` while independent branches continue, blocked jobs
+    never read their input, and ``blocked_by`` lists every failed or
+    blocked direct dependency in declaration order.
+
+    The whole plan (including unselected branches and an empty scope),
+    every input path, the output path and every changed input path are
+    validated first — a non-list ``changed_inputs``, blank/non-string
+    entries, absolute paths and symlink escapes all raise ValueError — so
+    no task runs and no file changes on error. Creating the output
+    directory or writing the report may raise OSError after tasks have
+    run; executed tasks are not undone.
+    """
+    deps_by_name, report_path = _validate_plan(root, jobs, output)
+    _hits, targets = _changed_targets(root, jobs, deps_by_name, changed_inputs)
+    if not targets:
+        return []
+    selected = _select_jobs(jobs, targets)
+    return _run_selected(root, selected, deps_by_name, report_path)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("plan")
@@ -812,43 +872,29 @@ def main():
                         help="show each task's record across REPORT (repeatable), read-only")
     parser.add_argument("--changed", action="append", default=None, metavar="PATH",
                         help="preview tasks affected by changed input PATH (repeatable), read-only")
+    parser.add_argument("--run-changed", action="append", default=None, metavar="PATH",
+                        help="run tasks affected by changed input PATH (repeatable)")
     args = parser.parse_args()
+    active = {name for name, chosen in (
+        ("run-changed", args.run_changed is not None),
+        ("changed", args.changed is not None),
+        ("only", args.only is not None),
+        ("preview", args.preview),
+        ("retry-preview", args.retry_preview is not None),
+        ("retry", args.retry is not None),
+        ("compare", args.compare is not None),
+        ("explain", args.explain is not None),
+        ("history", args.history is not None),
+    ) if chosen}
     try:
-        if args.changed is not None and (args.only is not None or args.preview
-                                         or args.retry_preview is not None
-                                         or args.retry is not None
-                                         or args.compare is not None
-                                         or args.explain is not None
-                                         or args.history is not None):
-            raise ValueError("--changed cannot be combined with --only, --preview, "
-                             "--retry-preview, --retry, --compare, --explain or --history")
-        if args.history is not None and (args.preview or args.retry_preview is not None
-                                         or args.retry is not None
-                                         or args.compare is not None
-                                         or args.explain is not None):
-            raise ValueError("--history cannot be combined with --preview, "
-                             "--retry-preview, --retry, --compare or --explain")
-        if args.explain is not None and (args.only is not None or args.preview
-                                         or args.retry_preview is not None
-                                         or args.retry is not None
-                                         or args.compare is not None
-                                         or args.history is not None):
-            raise ValueError("--explain cannot be combined with --only, --preview, "
-                             "--retry-preview, --retry, --compare or --history")
-        if args.compare is not None and (args.preview or args.only is not None
-                                         or args.retry_preview is not None
-                                         or args.retry is not None
-                                         or args.history is not None):
-            raise ValueError("--compare cannot be combined with --only, --preview, "
-                             "--retry-preview, --retry or --history")
-        if args.retry_preview is not None and (args.preview or args.only is not None
-                                               or args.history is not None):
-            raise ValueError("--retry-preview cannot be combined with --preview, --only or --history")
-        if args.retry is not None and (args.preview or args.only is not None
-                                       or args.retry_preview is not None
-                                       or args.history is not None):
-            raise ValueError("--retry cannot be combined with --only, --preview, "
-                             "--retry-preview or --history")
+        # Every mode is mutually exclusive except --only, which still
+        # narrows --preview and --history.
+        if len(active) > 1 and not (active <= {"only", "preview"}
+                                    or active <= {"only", "history"}):
+            raise ValueError("--run-changed, --changed, --only, --preview, "
+                             "--retry-preview, --retry, --compare, --explain and "
+                             "--history cannot be combined (only --preview or "
+                             "--history may take --only)")
         plan = local_path(args.root, args.plan)
         if plan == local_path(args.root, args.output):
             raise ValueError("report cannot overwrite its plan")
@@ -879,6 +925,8 @@ def main():
             return 0
         if args.retry is not None:
             results = run_retry(args.root, jobs, args.output, args.retry)
+        elif args.run_changed is not None:
+            results = run_changes(args.root, jobs, args.output, args.run_changed)
         else:
             results = run_plan(args.root, jobs, args.output, targets=args.only)
         summary = {"completed": sum(row["status"] == "completed" for row in results),
