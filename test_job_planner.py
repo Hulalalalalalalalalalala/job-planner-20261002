@@ -139,6 +139,107 @@ class JobPlannerTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     run_plan(self.root, jobs, "results/report.json")
 
+    def _deep_chain(self, count=2000):
+        """Build an acyclic chain of ``count`` jobs, each depending on the previous."""
+        jobs = []
+        for i in range(count):
+            job = {"name": f"j{i:04d}", "operation": "count-lines", "input": "notes.txt"}
+            if i:
+                job["depends_on"] = [f"j{i-1:04d}"]
+            jobs.append(job)
+        return jobs
+
+    def test_deep_acyclic_chain_validates_and_runs_without_recursion_limit_changes(self):
+        limit = sys.getrecursionlimit()
+        jobs = self._deep_chain()
+        result = run_plan(self.root, jobs, "results/report.json")
+        self.assertEqual(len(result), len(jobs))
+        self.assertTrue(all(row["status"] == "completed" for row in result))
+        self.assertEqual(len({row["name"] for row in result}), len(jobs))
+        # Preview of the chain tail covers every prerequisite in run order.
+        preview = preview_plan(self.root, jobs, "results/report.json",
+                               targets=[jobs[-1]["name"]])
+        self.assertEqual([job["name"] for job in preview["jobs"]],
+                         [row["name"] for row in result])
+        self.assertEqual(sys.getrecursionlimit(), limit)
+
+    def test_deep_chain_with_forward_references_shared_prerequisites_and_joins(self):
+        count = 2000
+        jobs = []
+        for i in range(count):
+            job = {"name": f"k{i:04d}", "operation": "count-lines", "input": "notes.txt"}
+            deps = []
+            if i < count - 1:
+                deps.append(f"k{i+1:04d}")
+            if 0 < i < count - 2:
+                deps.append(f"k{count-1:04d}")
+            if deps:
+                job["depends_on"] = deps
+            jobs.append(job)
+        result = run_plan(self.root, jobs, "results/report.json")
+        self.assertEqual(len(result), count)
+        self.assertTrue(all(row["status"] == "completed" for row in result))
+        # The same graph validates regardless of how the jobs are arranged.
+        shuffled = jobs[::2] + jobs[1::2]
+        self.assertEqual(len(run_plan(self.root, shuffled, "results/report.json")), count)
+
+    def test_deep_cycle_raises_value_error_before_running_or_reading_reports(self):
+        jobs = self._deep_chain()
+        run_plan(self.root, jobs, "results/history.json")
+        for cycle_at in (0, 1000, len(jobs) - 2):
+            cyclic = [dict(job) for job in jobs]
+            cyclic[cycle_at].setdefault("depends_on", []).append(jobs[-1]["name"])
+            with self.subTest(cycle_at=cycle_at):
+                for call in (
+                    lambda: run_plan(self.root, cyclic, "results/out.json"),
+                    lambda: run_plan(self.root, cyclic, "results/out.json",
+                                     targets=[cyclic[-1]["name"]]),
+                    lambda: preview_plan(self.root, cyclic, "results/out.json"),
+                    lambda: run_retry(self.root, cyclic, "results/out.json",
+                                      "results/history.json"),
+                    lambda: preview_retry(self.root, cyclic, "results/out.json",
+                                          "results/history.json"),
+                    lambda: compare_reports(self.root, cyclic, "results/out.json",
+                                            "results/history.json", "results/history.json"),
+                    lambda: explain_report(self.root, cyclic, "results/out.json",
+                                           "results/history.json"),
+                    lambda: query_history(self.root, cyclic, "results/out.json",
+                                          ["results/history.json"]),
+                ):
+                    with self.assertRaises(ValueError) as caught:
+                        call()
+                    self.assertIn("cycle", str(caught.exception))
+                self.assertFalse((self.root / "results/out.json").exists())
+
+    def test_cli_deep_chain_and_deep_cycle(self):
+        jobs = self._deep_chain()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        run = subprocess.run(prefix, capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout),
+                         {"completed": len(jobs), "failed": 0, "blocked": 0})
+        report = json.loads((self.root / ".results/latest.json").read_text())["results"]
+        self.assertEqual(len(report), len(jobs))
+        self.assertTrue(all(row["status"] == "completed" for row in report))
+
+        cyclic = [dict(job) for job in jobs]
+        cyclic[0]["depends_on"] = [jobs[-1]["name"]]
+        plan.write_text(json.dumps({"jobs": cyclic}), encoding="utf-8")
+        before = {path.relative_to(self.root) for path in self.root.rglob("*")}
+        run = subprocess.run(prefix + ["--output", ".results/cyclic.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertNotIn("Traceback", run.stderr)
+        self.assertNotIn("RecursionError", run.stdout + run.stderr)
+        output = json.loads(run.stdout)
+        self.assertEqual(set(output), {"error"})
+        self.assertIn("cycle", output["error"])
+        self.assertEqual({path.relative_to(self.root) for path in self.root.rglob("*")},
+                         before)
+
     def test_invalid_plan_preserves_existing_report(self):
         report = self.root / "results/report.json"
         report.parent.mkdir(parents=True, exist_ok=True)

@@ -60,15 +60,30 @@ def _validate_dependencies(jobs):
 
     state = {}
 
-    def visit(node):
-        if state.get(node) == 1:
-            raise ValueError("dependency cycle detected")
-        if state.get(node) == 2:
+    def visit(start):
+        """Depth-first cycle check from one node without recursion.
+
+        Same three-color walk as a recursive visit (1 = on the current
+        path, 2 = finished), but the frontier lives in an explicit stack
+        so dependency chains far longer than the interpreter recursion
+        limit still validate without touching that configuration.
+        """
+        if state.get(start) == 2:
             return
-        state[node] = 1
-        for dep in deps_by_name[node]:
-            visit(dep)
-        state[node] = 2
+        state[start] = 1
+        stack = [(start, iter(deps_by_name[start]))]
+        while stack:
+            node, pending = stack[-1]
+            for dep in pending:
+                if state.get(dep) == 1:
+                    raise ValueError("dependency cycle detected")
+                if state.get(dep) is None:
+                    state[dep] = 1
+                    stack.append((dep, iter(deps_by_name[dep])))
+                    break
+            else:
+                state[node] = 2
+                stack.pop()
 
     for name in deps_by_name:
         visit(name)
