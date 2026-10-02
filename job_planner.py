@@ -74,13 +74,13 @@ def _validate_dependencies(jobs):
     return deps_by_name
 
 
-def _select_jobs(jobs, targets):
-    """Return the plan-ordered sublist for targets plus all their prerequisites.
+def _validate_targets(jobs, targets):
+    """Validate exact-name targets without expanding prerequisites.
 
-    Targets match job names exactly; the whole plan must already be validated.
+    Targets must be a nonempty list of nonblank, unique plan job names;
+    the whole plan must already be validated. Returning the list lets
+    callers apply the same rule whether or not they select prerequisites.
     """
-    if targets is None:
-        return list(jobs)
     if not isinstance(targets, list) or not targets:
         raise ValueError("targets must be a nonempty list of job names")
     if any(not isinstance(target, str) or not target.strip() for target in targets):
@@ -91,6 +91,17 @@ def _select_jobs(jobs, targets):
     unknown = [target for target in targets if target not in names]
     if unknown:
         raise ValueError(f"unknown target {unknown[0]!r}")
+    return list(targets)
+
+
+def _select_jobs(jobs, targets):
+    """Return the plan-ordered sublist for targets plus all their prerequisites.
+
+    Targets match job names exactly; the whole plan must already be validated.
+    """
+    if targets is None:
+        return list(jobs)
+    _validate_targets(jobs, targets)
     deps_by_name = {job["name"]: job.get("depends_on", []) for job in jobs}
     keep = set()
     stack = list(targets)
@@ -429,6 +440,55 @@ def explain_report(root, jobs, output, report):
     return {"jobs": explained}
 
 
+def query_history(root, jobs, output, reports, targets=None):
+    """Collect one read-only task history across several run reports.
+
+    Returns ``{"jobs": [...]}`` in current plan order; each entry has only
+    ``name`` and ``history``, a list the same length as ``reports`` in the
+    exact order given (repeats produce repeated positions). Each history
+    item has only ``report`` (the path string verbatim) and ``record``:
+    ``null`` when the report has no record for the task, otherwise just
+    ``status`` with its matching payload, using the strict payload and
+    declaration-order ``blocked_by`` rules of ``compare_reports``; extra
+    report fields are ignored. A missing record is never a failure and is
+    never filled in from another report.
+
+    Without targets only tasks appearing in at least one report are
+    returned, so empty reports give ``{"jobs": []}``. With targets the
+    listed names are returned in plan order — dependencies are not added —
+    even if a name never appears, in which case every record is ``null``;
+    target argument order never changes the arrangement.
+
+    The whole plan, every input path and output protection are validated
+    first, then every report in full (including records outside any
+    target scope). Reports follow ``compare_reports``'s path, UTF-8,
+    structure, name, status and strict payload validation. ``reports``
+    must be a nonempty list of nonblank path strings; illegal reports or
+    targets, and any plan, path or report violation, raise ValueError.
+    Nothing is executed, created or written and task inputs are never
+    read; a report path may equal ``output``.
+    """
+    deps_by_name, _report_path = _validate_plan(root, jobs, output)
+    if not isinstance(reports, list) or not reports:
+        raise ValueError("reports must be a nonempty list of report paths")
+    if any(not isinstance(report, str) or not report.strip() for report in reports):
+        raise ValueError("report paths must be nonblank strings")
+    if targets is not None:
+        _validate_targets(jobs, targets)
+        chosen = [job["name"] for job in jobs if job["name"] in set(targets)]
+    records_by_report = [_read_compare_report(root, report, deps_by_name)
+                         for report in reports]
+    if targets is None:
+        chosen = [job["name"] for job in jobs
+                  if any(job["name"] in records for records in records_by_report)]
+    history_jobs = []
+    for name in chosen:
+        history = [{"report": report, "record": records.get(name)}
+                   for report, records in zip(reports, records_by_report)]
+        history_jobs.append({"name": name, "history": history})
+    return {"jobs": history_jobs}
+
+
 def preview_plan(root, jobs, output, targets=None):
     """Describe what run_plan would do, without executing or touching files.
 
@@ -558,8 +618,15 @@ def main():
                         help="compare two reports read-only and print per-task changes")
     parser.add_argument("--explain", metavar="REPORT",
                         help="explain read-only why the report's failed/blocked tasks did not pass")
+    parser.add_argument("--history", action="append", metavar="REPORT",
+                        help="query read-only per-task history across the named reports (repeatable)")
     args = parser.parse_args()
     try:
+        if args.history is not None and (args.explain is not None or args.compare is not None
+                                         or args.retry_preview is not None
+                                         or args.retry is not None or args.preview):
+            raise ValueError("--history cannot be combined with --preview, --retry-preview, "
+                             "--retry, --compare or --explain")
         if args.explain is not None and (args.only is not None or args.preview
                                          or args.retry_preview is not None
                                          or args.retry is not None
@@ -580,6 +647,11 @@ def main():
         if plan == local_path(args.root, args.output):
             raise ValueError("report cannot overwrite its plan")
         jobs = json.loads(plan.read_text(encoding="utf-8"))["jobs"]
+        if args.history is not None:
+            print(json.dumps(query_history(args.root, jobs, args.output,
+                                           args.history, targets=args.only),
+                             ensure_ascii=False, indent=2))
+            return 0
         if args.compare is not None:
             print(json.dumps(compare_reports(args.root, jobs, args.output,
                                              args.compare[0], args.compare[1]),
