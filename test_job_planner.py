@@ -2738,7 +2738,7 @@ class HistoryRetryPreviewTests(unittest.TestCase):
         marker.write_text("KEEP", encoding="utf-8")
         for extra in (["--max-failures", "2"],
                       ["--max-failures", "2", "--preview"],
-                      ["--max-failures", "2", "--run-history-retry", "r.json"],
+                      ["--max-failures", "2", "--explain", "r.json"],
                       ["--max-failures", "2", "--retry", "r.json"],
                       ["--max-failures", "2", "--changed", "notes.txt"],
                       ["--history-retry", "r.json", "--max-failures", "0"],
@@ -2994,6 +2994,306 @@ class RunHistoryRetryTests(unittest.TestCase):
         self.assertEqual(doc["execution"]["jobs"], preview["jobs"])
         self.assertEqual([job["name"] for job in doc["execution"]["jobs"]],
                          [row["name"] for row in result])
+
+    def test_max_failures_none_and_omitted_keep_original_scope(self):
+        jobs = self._jobs()
+        run_plan(self.root, jobs, "r1.json")
+        self._write_report("r2.json", {"results": [
+            {"name": "broken", "status": "completed", "result": {"lines": 2}},
+            {"name": "healthy", "status": "completed", "result": {"lines": 2}},
+        ]})
+        expected = ["broken", "downstream", "healthy", "joiner"]
+        omitted = run_history_retry(self.root, jobs, "a.json",
+                                    ["r1.json", "r2.json"])
+        explicit = run_history_retry(self.root, jobs, "b.json",
+                                     ["r1.json", "r2.json"], max_failures=None)
+        self.assertEqual([row["name"] for row in omitted], expected)
+        self.assertEqual([row["name"] for row in explicit], expected)
+
+    def test_max_failures_filters_scope_like_the_preview(self):
+        jobs = self._jobs()
+        # broken fails in both reports (count 2); downstream stays blocked
+        # behind it; healthy fails once (count 1).
+        self._write_report("r1.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "a"},
+            {"name": "downstream", "status": "blocked", "blocked_by": ["broken"]},
+        ]})
+        self._write_report("r2.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "b"},
+            {"name": "downstream", "status": "blocked", "blocked_by": ["broken"]},
+            {"name": "healthy", "status": "failed", "error": "c"},
+        ]})
+        preview = preview_history_retry(self.root, jobs, "out.json",
+                                        ["r1.json", "r2.json"], max_failures=2)
+        self.assertEqual(preview["targets"], ["healthy"])
+        result = run_history_retry(self.root, jobs, "out.json",
+                                   ["r1.json", "r2.json"], max_failures=2)
+        # The run covers exactly the retained target; broken, downstream,
+        # joiner and the unrelated branch are not read or recorded.
+        self.assertEqual([row["name"] for row in result],
+                         [row["name"] for row in preview["jobs"]])
+        self.assertEqual(result, [{"name": "healthy", "status": "completed",
+                                   "result": {"lines": 2}}])
+        written = json.loads((self.root / "out.json").read_text())
+        self.assertEqual(set(written), {"results"})
+        self.assertEqual(written["results"], result)
+        # The historical reports are untouched.
+        self.assertEqual(len(json.loads((self.root / "r1.json").read_text())["results"]), 2)
+        self.assertEqual(len(json.loads((self.root / "r2.json").read_text())["results"]), 3)
+
+    def test_max_failures_excluded_job_with_missing_input_is_never_attempted(self):
+        jobs = [
+            # Excluded candidate: its input does not exist; had it run, the
+            # record would be failed.
+            {"name": "bad", "operation": "count-lines", "input": "missing.txt"},
+            # Retained candidate, independently runnable.
+            {"name": "fine", "operation": "count-lines", "input": "notes.txt"},
+        ]
+        for round_, payload in (
+                ("r1.json", [
+                    {"name": "bad", "status": "failed", "error": "x"},
+                    {"name": "fine", "status": "failed", "error": "y"}]),
+                # fine is unrecorded in the newer report: its latest status
+                # stays failed, but its count stays 1.
+                ("r2.json", [
+                    {"name": "bad", "status": "failed", "error": "z"}])):
+            self._write_report(round_, {"results": payload})
+        result = run_history_retry(self.root, jobs, "out.json",
+                                   ["r1.json", "r2.json"], max_failures=2)
+        # bad reached the limit and is dropped entirely; fine (count 1) runs.
+        self.assertEqual([row["name"] for row in result], ["fine"])
+        self.assertEqual(result[0]["status"], "completed")
+
+    def test_max_failures_indirect_prerequisite_at_limit_excludes_targets(self):
+        jobs = [
+            {"name": "top", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["mid"]},
+            {"name": "mid", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["base"]},
+            {"name": "base", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "other", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["base"]},
+        ]
+        self._write_report("r1.json", {"results": [
+            {"name": "base", "status": "failed", "error": "a"},
+            {"name": "top", "status": "blocked", "blocked_by": ["mid"]},
+            {"name": "mid", "status": "blocked", "blocked_by": ["base"]},
+            {"name": "other", "status": "blocked", "blocked_by": ["base"]},
+        ]})
+        self._write_report("r2.json", {"results": [
+            {"name": "base", "status": "failed", "error": "b"}]})
+        preview = preview_history_retry(self.root, jobs, "deep/out.json",
+                                        ["r1.json", "r2.json"], max_failures=2)
+        self.assertEqual(preview["targets"], [])
+        # Every candidate is excluded through base: nothing runs and no
+        # output directory is created.
+        before = {p.name for p in self.root.iterdir()}
+        self.assertEqual(run_history_retry(self.root, jobs, "deep/out.json",
+                                           ["r1.json", "r2.json"],
+                                           max_failures=2), [])
+        self.assertFalse((self.root / "deep").exists())
+        self.assertEqual({p.name for p in self.root.iterdir()}, before)
+
+    def test_max_failures_all_excluded_returns_empty_and_leaves_report(self):
+        jobs = [{"name": "ghost", "operation": "count-lines", "input": "nope.txt"}]
+        self._write_report("r1.json", {"results": [
+            {"name": "ghost", "status": "failed", "error": "a"}]})
+        self._write_report("r2.json", {"results": [
+            {"name": "ghost", "status": "failed", "error": "b"}]})
+        marker = self._write_report("keep.json", {"results": [{"name": "kept"}]})
+        marker_text = marker.read_text()
+        self.assertEqual(run_history_retry(self.root, jobs, "deep/new/out.json",
+                                           ["r1.json", "r2.json"],
+                                           max_failures=2), [])
+        self.assertFalse((self.root / "deep").exists())
+        self.assertEqual(marker.read_text(), marker_text)
+
+    def test_max_failures_validation(self):
+        jobs = self._jobs()
+        self._write_report("r.json", {"results": []})
+        for bad in (True, False, 0, -1, 2.5, "2", [2], 0.0):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    run_history_retry(self.root, jobs, "out.json", ["r.json"],
+                                      max_failures=bad)
+        self.assertFalse((self.root / "out.json").exists())
+
+    def test_max_failures_validates_reports_and_plan_before_running(self):
+        jobs = self._jobs()
+        self._write_report("ok.json", {"results": []})
+        marker = self._write_report("keep.json", {"results": []})
+        marker_bytes = marker.read_bytes()
+        strict_cases = {
+            "bad-encoding": b'{"results": []}\xff',
+            "bad-json": b"{not json",
+            "unknown-name": b'{"results": [{"name": "ghost", "status": "completed", "result": {}}]}',
+            "completed-no-result": b'{"results":[{"name":"healthy","status":"completed"}]}',
+            "nan-extra": b'{"results": [], "extra": NaN}',
+        }
+        for label, raw in strict_cases.items():
+            with self.subTest(label=label):
+                self._write_report(f"{label}.json", None, raw=raw)
+                with self.assertRaises(ValueError):
+                    run_history_retry(self.root, jobs, "keep.json",
+                                      ["ok.json", f"{label}.json"],
+                                      max_failures=2)
+        # An overridden old bad record is still validated even though the
+        # task's latest state keeps it out of the range.
+        self._write_report("old-bad.json", None,
+                           raw=b'{"results":[{"name":"healthy","status":"completed"}]}')
+        self._write_report("new-good.json", {"results": [
+            {"name": "healthy", "status": "completed", "result": {"lines": 2}}]})
+        with self.assertRaises(ValueError):
+            run_history_retry(self.root, jobs, "keep.json",
+                              ["old-bad.json", "new-good.json"], max_failures=2)
+        for bad in ("missing.json", "../outside.json", str(ROOT / "README.md")):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    run_history_retry(self.root, jobs, "keep.json", [bad],
+                                      max_failures=2)
+        bad_input = jobs + [{"name": "stray", "operation": "count-lines",
+                             "input": "../outside.txt"}]
+        with self.assertRaises(ValueError):
+            run_history_retry(self.root, bad_input, "deep/out.json",
+                              ["ok.json"], max_failures=2)
+        with self.assertRaises(ValueError):
+            run_history_retry(self.root, jobs, "notes.txt", ["ok.json"],
+                              max_failures=2)
+        self.assertFalse((self.root / "deep").exists())
+        self.assertEqual(marker.read_bytes(), marker_bytes)
+
+    def test_max_failures_record_reasons_match_preview_and_reasons_query(self):
+        jobs = self._jobs()
+        self._write_report("r1.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "a"},
+            {"name": "downstream", "status": "blocked", "blocked_by": ["broken"]},
+        ]})
+        self._write_report("r2.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "b"},
+            {"name": "downstream", "status": "blocked", "blocked_by": ["broken"]},
+            {"name": "healthy", "status": "failed", "error": "c"},
+        ]})
+        preview = preview_history_retry(self.root, jobs, "out.json",
+                                        ["r1.json", "r2.json"], max_failures=2)
+        result = run_history_retry(self.root, jobs, "out.json",
+                                   ["r1.json", "r2.json"],
+                                   record_reasons=True, max_failures=2)
+        doc = json.loads((self.root / "out.json").read_text())
+        execution = doc["execution"]
+        # mode stays retry; exactly mode/targets/jobs, no new fields.
+        self.assertEqual(set(execution), {"mode", "targets", "jobs"})
+        self.assertEqual(execution["mode"], "retry")
+        self.assertEqual(execution["targets"], preview["targets"])
+        self.assertEqual(execution["targets"], ["healthy"])
+        self.assertEqual(execution["jobs"], preview["jobs"])
+        self.assertEqual([job["name"] for job in execution["jobs"]],
+                         [row["name"] for row in result])
+        # The existing reasons query reads the filtered execution back.
+        queried = query_execution(self.root, jobs, "out.json", "out.json")
+        self.assertEqual(queried, {"execution": execution})
+        # Default off still records only results.
+        run_history_retry(self.root, jobs, "plain.json",
+                          ["r1.json", "r2.json"], max_failures=2)
+        self.assertEqual(set(json.loads((self.root / "plain.json").read_text())),
+                         {"results"})
+
+    def test_max_failures_with_aliased_output_uses_pre_overwrite_content(self):
+        jobs = self._jobs()
+        run_plan(self.root, jobs, "same.json")
+        preview = preview_history_retry(self.root, jobs, "same.json",
+                                        ["same.json"], max_failures=2)
+        # broken failed once, so limit 2 retains the whole range; the scope
+        # and reasons come from the content read before same.json is
+        # overwritten.
+        self.assertEqual(preview["targets"], ["broken", "downstream", "joiner"])
+        result = run_history_retry(self.root, jobs, "same.json",
+                                   ["./same.json"], record_reasons=True,
+                                   max_failures=2)
+        self.assertEqual([row["name"] for row in result],
+                         ["broken", "downstream", "healthy", "joiner"])
+        doc = json.loads((self.root / "same.json").read_text())
+        self.assertEqual(doc["results"], result)
+        self.assertEqual(doc["execution"]["targets"], preview["targets"])
+        self.assertEqual(doc["execution"]["jobs"], preview["jobs"])
+
+    def test_cli_run_history_retry_max_failures_scope_counts_and_exit_code(self):
+        jobs = self._jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        self._write_report("r1.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "a"},
+            {"name": "downstream", "status": "blocked", "blocked_by": ["broken"]},
+        ]})
+        self._write_report("r2.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "b"},
+            {"name": "downstream", "status": "blocked", "blocked_by": ["broken"]},
+            {"name": "healthy", "status": "failed", "error": "c"},
+        ]})
+        run = subprocess.run(prefix + ["--run-history-retry", "r1.json",
+                                       "--run-history-retry", "r2.json",
+                                       "--max-failures", "2",
+                                       "--output", "out.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        # Counts describe only the actual scope: healthy completed, nothing
+        # failed and no blocked key appears for this dependency-free scope.
+        self.assertEqual(json.loads(run.stdout), {"completed": 1, "failed": 0})
+        written = json.loads((self.root / "out.json").read_text())["results"]
+        self.assertEqual([row["name"] for row in written], ["healthy"])
+        # It combines with --record-reasons and records the filtered preview.
+        run = subprocess.run(prefix + ["--run-history-retry", "r1.json",
+                                       "--run-history-retry", "r2.json",
+                                       "--max-failures", "2",
+                                       "--output", "reasons.json",
+                                       "--record-reasons"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        doc = json.loads((self.root / "reasons.json").read_text())
+        self.assertEqual(doc["execution"]["mode"], "retry")
+        self.assertEqual(doc["execution"]["targets"], ["healthy"])
+        self.assertEqual([job["name"] for job in doc["execution"]["jobs"]],
+                         ["healthy"])
+        # Every candidate excluded: zeroes, exit 0, no directory, old report
+        # bytes preserved.
+        marker = self._write_report("keep.json", {"results": []})
+        marker_text = marker.read_text()
+        run = subprocess.run(prefix + ["--run-history-retry", "r1.json",
+                                       "--run-history-retry", "r2.json",
+                                       "--max-failures", "1",
+                                       "--output", "deep/out.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), {"completed": 0, "failed": 0})
+        self.assertFalse((self.root / "deep").exists())
+        self.assertEqual(marker.read_text(), marker_text)
+
+    def test_cli_run_history_retry_max_failures_errors_and_conflicts(self):
+        jobs = self._jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        self._write_report("r.json", {"results": []})
+        marker = self._write_report("keep.json", {"results": []})
+        marker_text = marker.read_text()
+        for extra in (["--run-history-retry", "r.json", "--max-failures", "0"],
+                      ["--run-history-retry", "r.json", "--max-failures", "-1"],
+                      ["--run-history-retry", "r.json", "--max-failures", "x"],
+                      ["--run-history-retry", "r.json", "--max-failures", "2.5"],
+                      ["--max-failures", "2", "--run-changed", "notes.txt"],
+                      ["--max-failures", "2", "--run-history-retry", "missing.json"],
+                      ["--run-history-retry", "r.json", "--max-failures", "2",
+                       "--history-retry", "r.json"],
+                      ["--run-history-retry", "r.json", "--max-failures", "2",
+                       "--only", "healthy"],
+                      ["--run-history-retry", "r.json", "--max-failures", "2",
+                       "--preview"]):
+            run = subprocess.run(prefix + extra, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, (extra, run.stderr))
+            self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self.assertEqual(marker.read_text(), marker_text)
 
     def test_cli_run_history_retry_flag_counts_and_exit_code(self):
         jobs = self._jobs()

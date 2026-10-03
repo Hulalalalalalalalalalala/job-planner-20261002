@@ -65,17 +65,17 @@ reports, escaping paths or a bad plan exit 2 with an error JSON and no
 partial result. Nothing is read besides the plan and reports, a report
 may equal --output, and nothing is created or written. Cannot combine with
 --only, --record-reasons or any other execution, preview or query option.
-Add --max-failures N (a positive integer, only valid with --history-retry)
-to exclude candidates that have failed N times since their last completed
-record — completed resets the count, blocked and missing records change
-nothing, repeated paths count per position — or whose direct or indirect
-prerequisites reached the limit. The output then gains an excluded array
-(entries with only name, failures and limited_by, plan-ordered and
-deduplicated, limited_by including the candidate itself when it is at the
-limit); targets/jobs/sources cover only the retained candidates. No
-candidates prints four empty arrays; all excluded leaves only excluded
-non-empty. Invalid values or option combinations exit 2 with an error
-JSON and no partial preview.
+Add --max-failures N (a positive integer, only valid with --history-retry
+or --run-history-retry) to exclude candidates that have failed N times
+since their last completed record — completed resets the count, blocked
+and missing records change nothing, repeated paths count per position —
+or whose direct or indirect prerequisites reached the limit. The preview
+then gains an excluded array (entries with only name, failures and
+limited_by, plan-ordered and deduplicated, limited_by including the
+candidate itself when it is at the limit); targets/jobs/sources cover
+only the retained candidates. No candidates prints four empty arrays;
+all excluded leaves only excluded non-empty. Invalid values or option
+combinations exit 2 with an error JSON and no partial preview.
 
 History retry run
 python3 job_planner.py samples/plan-dependencies.json --run-history-retry r1.json --run-history-retry r2.json --output .results/deps.json
@@ -91,9 +91,18 @@ same file (the range uses the pre-overwrite content). No targets prints
 {"completed":0,"failed":0}, exits 0 and touches no files. Bad reports,
 plans or option combinations exit 2 with an error JSON; save failures exit
 2 with an error-only JSON and no statistics, keep the previous report
-byte-for-byte (or absent) and do not undo finished tasks. --record-reasons is
-allowed and records mode "retry" with the preview's targets/jobs (no
-sources); every other execution, preview or query option conflicts.
+byte-for-byte (or absent) and do not undo finished tasks. Add
+--max-failures N to run exactly the filtered range --history-retry
+--max-failures N would preview: candidates at the failure limit, or whose
+direct or indirect prerequisites reached it, are dropped before running
+— their inputs are never read and they produce no records, while the
+retained targets keep all prerequisites (shared once). All excluded prints
+{"completed":0,"failed":0}, exits 0 and touches no files; counts and the
+exit code describe only the actual scope. A non-positive or non-integer N
+exits 2 with an error JSON. --record-reasons is allowed and records mode
+"retry" with the filtered preview's targets/jobs (no sources or excluded);
+every other execution, preview or query option conflicts, and
+--max-failures is illegal outside the history retry preview and run.
 
 Compare
 python3 job_planner.py samples/plan-dependencies.json --compare .results/deps.json .results/deps.json
