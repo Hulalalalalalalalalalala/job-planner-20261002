@@ -934,6 +934,41 @@ def _require_max_failures(max_failures):
     return max_failures
 
 
+def _history_retry_limited(root, jobs, deps_by_name, reports, max_failures):
+    """Compute the failure-limited history retry selection.
+
+    Shared by ``preview_history_retry`` and ``run_history_retry`` so an
+    enabled limit filters both identically; ``max_failures`` is already
+    validated. Returns ``(targets, sources, excluded)`` in
+    ``preview_history_retry``'s plan order, with ``excluded`` possibly
+    empty; see that function for the counting and exclusion semantics.
+    """
+    candidates, candidate_sources, counts = _history_retry_scan(
+        root, jobs, deps_by_name, reports)
+    plan_order = [job["name"] for job in jobs]
+    targets = []
+    sources = []
+    excluded = []
+    for candidate, source in zip(candidates, candidate_sources):
+        closure = {candidate}
+        stack = [candidate]
+        while stack:
+            node = stack.pop()
+            for dep in deps_by_name[node]:
+                if dep not in closure:
+                    closure.add(dep)
+                    stack.append(dep)
+        limited_by = [name for name in plan_order
+                      if name in closure and counts[name] >= max_failures]
+        if limited_by:
+            excluded.append({"name": candidate, "failures": counts[candidate],
+                             "limited_by": limited_by})
+        else:
+            targets.append(candidate)
+            sources.append(source)
+    return targets, sources, excluded
+
+
 def preview_history_retry(root, jobs, output, reports, max_failures=None):
     """Preview a retry range from several historical reports, read-only.
 
@@ -1004,29 +1039,8 @@ def preview_history_retry(root, jobs, output, reports, max_failures=None):
         return {"targets": targets,
                 "jobs": _preview_entries(jobs, deps_by_name, targets),
                 "sources": sources}
-    candidates, candidate_sources, counts = _history_retry_scan(
-        root, jobs, deps_by_name, reports)
-    plan_order = [job["name"] for job in jobs]
-    targets = []
-    sources = []
-    excluded = []
-    for candidate, source in zip(candidates, candidate_sources):
-        closure = {candidate}
-        stack = [candidate]
-        while stack:
-            node = stack.pop()
-            for dep in deps_by_name[node]:
-                if dep not in closure:
-                    closure.add(dep)
-                    stack.append(dep)
-        limited_by = [name for name in plan_order
-                      if name in closure and counts[name] >= max_failures]
-        if limited_by:
-            excluded.append({"name": candidate, "failures": counts[candidate],
-                             "limited_by": limited_by})
-        else:
-            targets.append(candidate)
-            sources.append(source)
+    targets, sources, excluded = _history_retry_limited(
+        root, jobs, deps_by_name, reports, max_failures)
     if not targets:
         return {"targets": [], "jobs": [], "sources": [], "excluded": excluded}
     return {"targets": targets,
@@ -1386,7 +1400,8 @@ def run_retry(root, jobs, output, report, record_reasons=False):
     return _run_selected(root, selected, deps_by_name, report_path, execution)
 
 
-def run_history_retry(root, jobs, output, reports, record_reasons=False):
+def run_history_retry(root, jobs, output, reports, record_reasons=False,
+                      max_failures=None):
     """Execute a manual retry range derived from several historical reports.
 
     Target selection and scope mirror ``preview_history_retry``: ``reports``
@@ -1401,6 +1416,23 @@ def run_history_retry(root, jobs, output, reports, record_reasons=False):
     shared prerequisites run once; unrelated branches are neither read nor
     recorded.
 
+    With ``max_failures=None`` (the default, also when the CLI flag is
+    absent) the call is exactly the original retry. With ``max_failures``
+    set — only ``None`` or a positive, non-boolean integer is accepted;
+    anything else raises ValueError — the targets, scope and processing
+    order are exactly what ``preview_history_retry`` returns for the same
+    inputs with that limit: failures accumulate per task since its latest
+    ``completed`` record (``completed`` resets the count, ``blocked`` and
+    missing records are neutral and a repeated report path counts once per
+    position), and a candidate is excluded when its own count or the count
+    of any direct or indirect prerequisite has reached the limit. Excluded
+    candidates and their non-shared branches are outside the run entirely:
+    their inputs are not read, they produce no records and they cannot
+    block or be blocked by this run; the run keeps only the retained
+    targets and all of their prerequisites, with shared prerequisites
+    executed once. The preview's ``excluded`` array is not executed,
+    recorded or otherwise surfaced.
+
     Execution order, failure records and ``blocked_by`` propagation are
     exactly ``run_plan``'s, driven solely by this run's results: input read
     failures, unknown operations and invalid contents are recorded
@@ -1409,38 +1441,49 @@ def run_history_retry(root, jobs, output, reports, record_reasons=False):
     processing order and is written to ``output`` under ``results``,
     replacing any prior content — old records are never copied. A report
     path may equal ``output`` or name the same file another way; the range
-    is chosen from all the historical content read before the overwrite.
+    is chosen from all the historical content read before the overwrite,
+    so scope and reasons then follow that pre-overwrite content.
 
-    With no targets the empty list is returned without reading task inputs,
-    creating directories or touching the report. The whole plan (including
-    unselected branches and an empty scope), every input path and the
-    output path are validated first, and then every report is fully
-    validated under ``preview_history_retry``'s path, UTF-8, structure,
-    name, status and strict payload rules — including out-of-scope and
-    overridden older records — so an illegal ``reports``, plan or report
-    raises ValueError before anything runs and no file changes. Saving
-    follows ``run_plan``'s atomic rule: an unencodable report raises
-    ValueError and a filesystem error while creating the output
-    directory, saving the content or replacing the output raises OSError,
-    in both cases after tasks have run, with the pre-run output file
-    preserved byte-for-byte (or still absent when there was none), no
-    partial or extra files left behind and executed tasks not undone — so
-    a historical report aliasing ``output`` stays queryable after a
-    failed save, and only a successful save replaces it with this run's
-    results.
+    With no retained targets — no candidates at all, or every candidate
+    excluded by the limit — the empty list is returned without reading
+    task inputs, creating directories or touching the report; the CLI then
+    prints ``{"completed": 0, "failed": 0}`` and exits 0, and its
+    statistics and exit code otherwise describe only the actual scope. The
+    whole plan (including unselected branches and an empty scope), every
+    input path and the output path are validated first, and then every
+    report is fully validated under ``preview_history_retry``'s path,
+    UTF-8, structure, name, status and strict payload rules — including
+    out-of-scope, excluded and overridden older records — so an illegal
+    ``max_failures``, ``reports``, plan or report raises ValueError before
+    anything runs and no file changes. Saving follows ``run_plan``'s
+    atomic rule: an unencodable report raises ValueError and a filesystem
+    error while creating the output directory, saving the content or
+    replacing the output raises OSError, in both cases after tasks have
+    run, with the pre-run output file preserved byte-for-byte (or still
+    absent when there was none), no partial or extra files left behind and
+    executed tasks not undone — so a historical report aliasing ``output``
+    stays queryable after a failed save, and only a successful save
+    replaces it with this run's results.
 
-    With ``record_reasons=True`` and at least one target, the written
-    report additionally carries the top-level ``execution`` object with
-    ``mode`` ``"retry"``; ``targets`` and ``jobs`` are exactly
-    ``preview_history_retry``'s (``sources`` is not recorded), in the same
+    With ``record_reasons=True`` and at least one retained target, the
+    written report additionally carries the top-level ``execution`` object
+    with ``mode`` ``"retry"``; ``targets`` and ``jobs`` are exactly the
+    filtered ``preview_history_retry``'s (its ``sources`` and ``excluded``
+    are not recorded and no field is added for the limit), in the same
     names and order as ``results``, computed from the report contents read
     before any overwrite, and the reasons query reads them back. With no
-    targets nothing is written and no ``execution`` is recorded.
+    retained target nothing is written and no ``execution`` is recorded.
     ``record_reasons`` must be a bool; other values raise ValueError.
     """
     _require_bool(record_reasons)
+    max_failures = _require_max_failures(max_failures)
     deps_by_name, report_path = _validate_plan(root, jobs, output)
-    targets, _sources = _history_retry_targets(root, jobs, deps_by_name, reports)
+    if max_failures is None:
+        targets, _sources = _history_retry_targets(root, jobs, deps_by_name,
+                                                   reports)
+    else:
+        targets, _sources, _excluded = _history_retry_limited(
+            root, jobs, deps_by_name, reports, max_failures)
     if not targets:
         return []
     selected = _select_jobs(jobs, targets)
@@ -1535,8 +1578,9 @@ def main():
                         help="preview a retry range from the newest matching record "
                              "across REPORT (repeatable, oldest to newest), read-only")
     parser.add_argument("--max-failures", default=None, metavar="N",
-                        help="with --history-retry, exclude candidates that reached "
-                             "N failures since their last completed record, or whose "
+                        help="with --history-retry or --run-history-retry, "
+                             "exclude candidates that reached N failures since "
+                             "their last completed record, or whose "
                              "prerequisites did")
     parser.add_argument("--run-history-retry", action="append", default=None,
                         metavar="REPORT",
@@ -1582,8 +1626,11 @@ def main():
                              "--record-reasons, --preview, --retry-preview, --retry, "
                              "--compare, --explain, --history, --execution, "
                              "--changed or --run-changed")
-        if args.max_failures is not None and args.history_retry is None:
-            raise ValueError("--max-failures can only be used with --history-retry")
+        if (args.max_failures is not None and args.history_retry is None
+                and args.run_history_retry is None):
+            raise ValueError(
+                "--max-failures can only be used with --history-retry or "
+                "--run-history-retry")
         if args.execution is not None and (args.only is not None or args.record_reasons
                                            or args.preview or args.retry_preview is not None
                                            or args.retry is not None
@@ -1648,6 +1695,14 @@ def main():
         plan = local_path(args.root, args.plan)
         if plan == local_path(args.root, args.output):
             raise ValueError("report cannot overwrite its plan")
+        max_failures = None
+        if args.max_failures is not None:
+            try:
+                max_failures = int(args.max_failures)
+            except ValueError:
+                raise ValueError("--max-failures must be a positive integer")
+            if max_failures < 1:
+                raise ValueError("--max-failures must be a positive integer")
         jobs = json.loads(plan.read_text(encoding="utf-8"))["jobs"]
         if args.changed is not None:
             print(json.dumps(preview_changes(args.root, jobs, args.output, args.changed),
@@ -1658,14 +1713,6 @@ def main():
                                                args.history, targets=args.only)))
             return 0
         if args.history_retry is not None:
-            max_failures = None
-            if args.max_failures is not None:
-                try:
-                    max_failures = int(args.max_failures)
-                except ValueError:
-                    raise ValueError("--max-failures must be a positive integer")
-                if max_failures < 1:
-                    raise ValueError("--max-failures must be a positive integer")
             print(json.dumps(preview_history_retry(args.root, jobs, args.output,
                                                    args.history_retry,
                                                    max_failures=max_failures),
@@ -1701,7 +1748,8 @@ def main():
         elif args.run_history_retry is not None:
             results = run_history_retry(args.root, jobs, args.output,
                                         args.run_history_retry,
-                                        record_reasons=args.record_reasons)
+                                        record_reasons=args.record_reasons,
+                                        max_failures=max_failures)
         else:
             results = run_plan(args.root, jobs, args.output, targets=args.only,
                                record_reasons=args.record_reasons)

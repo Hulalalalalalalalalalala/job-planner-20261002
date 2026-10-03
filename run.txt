@@ -65,7 +65,8 @@ reports, escaping paths or a bad plan exit 2 with an error JSON and no
 partial result. Nothing is read besides the plan and reports, a report
 may equal --output, and nothing is created or written. Cannot combine with
 --only, --record-reasons or any other execution, preview or query option.
-Add --max-failures N (a positive integer, only valid with --history-retry)
+Add --max-failures N (a positive integer, valid only with --history-retry
+or --run-history-retry)
 to exclude candidates that have failed N times since their last completed
 record — completed resets the count, blocked and missing records change
 nothing, repeated paths count per position — or whose direct or indirect
@@ -94,6 +95,14 @@ plans or option combinations exit 2 with an error JSON; save failures exit
 byte-for-byte (or absent) and do not undo finished tasks. --record-reasons is
 allowed and records mode "retry" with the preview's targets/jobs (no
 sources); every other execution, preview or query option conflicts.
+--max-failures N is allowed too and executes exactly the retained range
+the preview would show with the same reports and limit (same counting,
+reset and prerequisite-exclusion rules; excluded candidates are not
+read or recorded); statistics and the exit code describe only that
+range, all excluded prints {"completed":0,"failed":0}, exits 0 and
+touches no files, and an illegal N exits 2 with an error JSON. It may be
+combined with --record-reasons, which then records the filtered
+targets/jobs with mode "retry" and no extra fields.
 
 Compare
 python3 job_planner.py samples/plan-dependencies.json --compare .results/deps.json .results/deps.json
