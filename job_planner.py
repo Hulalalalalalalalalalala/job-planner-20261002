@@ -870,27 +870,35 @@ def preview_retry(root, jobs, output, report):
     return {"targets": targets, "jobs": _preview_entries(jobs, deps_by_name, targets)}
 
 
-def _history_retry_targets(root, jobs, deps_by_name, reports):
-    """Validate ``reports`` and return the retry range's ``(targets, sources)``.
+def _read_history_reports(root, deps_by_name, reports):
+    """Validate ``reports`` and return one validated record map per report.
 
-    Shared by ``preview_history_retry`` and ``run_history_retry`` so both
-    always select the same range: reports are read strictly in the given
-    order (repeats keep separate positions) and each task is judged by the
-    last report recording it — a later report missing the task never clears
-    an older status. Targets are the tasks whose latest record is
-    ``failed`` or ``blocked``, in current plan order; sources parallels
-    targets with each target's latest status, report path and zero-based
-    report index. Every report is fully validated, including out-of-scope
-    and overridden records.
+    Shared by the history-retry entry points: the list must be nonempty and
+    hold nonblank path strings, and every report is fully validated under
+    the compare report's strict rules — including out-of-scope and
+    overridden records — before any selection happens.
     """
     if not isinstance(reports, list) or not reports:
         raise ValueError("reports must be a nonempty list of report paths")
     if any(not isinstance(report, str) or not report.strip() for report in reports):
         raise ValueError("report paths must be nonblank strings")
+    return [_read_compare_report(root, report, deps_by_name,
+                                 exact_numbers=True)
+            for report in reports]
+
+
+def _history_retry_selection(jobs, reports, report_records):
+    """Return the retry range's ``(targets, sources)`` from validated records.
+
+    Reports are applied strictly in the given order (repeats keep separate
+    positions) and each task is judged by the last report recording it — a
+    later report missing the task never clears an older status. Targets are
+    the tasks whose latest record is ``failed`` or ``blocked``, in current
+    plan order; sources parallels targets with each target's latest status,
+    report path and zero-based report index.
+    """
     latest = {}
-    for index, report in enumerate(reports):
-        records = _read_compare_report(root, report, deps_by_name,
-                                       exact_numbers=True)
+    for index, (report, records) in enumerate(zip(reports, report_records)):
         for name, record in records.items():
             latest[name] = {"status": record["status"],
                             "report": report, "index": index}
@@ -905,7 +913,52 @@ def _history_retry_targets(root, jobs, deps_by_name, reports):
     return targets, sources
 
 
-def preview_history_retry(root, jobs, output, reports):
+def _history_retry_targets(root, jobs, deps_by_name, reports):
+    """Validate ``reports`` and return the retry range's ``(targets, sources)``.
+
+    Shared by ``preview_history_retry`` and ``run_history_retry`` so both
+    always select the same range: reports are read strictly in the given
+    order (repeats keep separate positions) and each task is judged by the
+    last report recording it — a later report missing the task never clears
+    an older status. Targets are the tasks whose latest record is
+    ``failed`` or ``blocked``, in current plan order; sources parallels
+    targets with each target's latest status, report path and zero-based
+    report index. Every report is fully validated, including out-of-scope
+    and overridden records.
+    """
+    report_records = _read_history_reports(root, deps_by_name, reports)
+    return _history_retry_selection(jobs, reports, report_records)
+
+
+def _validate_max_failures(max_failures):
+    """Validate the failure limit: only ``None`` or a non-bool positive int."""
+    if max_failures is None:
+        return None
+    if (isinstance(max_failures, bool) or not isinstance(max_failures, int)
+            or max_failures < 1):
+        raise ValueError("max_failures must be None or a positive integer")
+    return max_failures
+
+
+def _failure_counts(jobs, report_records):
+    """Return each task's failure count across validated report records.
+
+    Reports are applied in the given order, so a repeated report path counts
+    at every position: a ``failed`` record adds one to the task's count, a
+    ``completed`` record resets it to zero, and a ``blocked`` or missing
+    record leaves it untouched.
+    """
+    counts = {job["name"]: 0 for job in jobs}
+    for records in report_records:
+        for name, record in records.items():
+            if record["status"] == "completed":
+                counts[name] = 0
+            elif record["status"] == "failed":
+                counts[name] += 1
+    return counts
+
+
+def preview_history_retry(root, jobs, output, reports, max_failures=None):
     """Preview a retry range from several historical reports, read-only.
 
     ``reports`` is a nonempty list of nonblank root-relative report paths,
@@ -930,25 +983,75 @@ def preview_history_retry(root, jobs, output, reports):
     previewed run's dependency decisions would still follow the ordinary
     run rules.
 
+    ``max_failures`` is ``None`` (the default, no limit, and the result
+    keeps the three-field shape above) or a non-boolean positive integer;
+    any other value raises ValueError. With a limit the result gains a
+    fourth field, ``excluded``: every task starts at zero and the reports
+    are walked in the given order — a repeated report counts at each of
+    its positions — with a ``failed`` record adding one to the task's
+    count, a ``completed`` record resetting it to zero, and a ``blocked``
+    or missing record changing nothing. A candidate whose own count, or
+    the count of any of its direct or indirect prerequisites, has reached
+    the limit is excluded instead of targeted; each excluded entry has
+    only ``name`` (the candidate), ``failures`` (its own count) and
+    ``limited_by`` (every task that caused the exclusion — the candidate
+    itself included when its own count reached the limit — in plan order
+    without repeats). ``targets``, ``excluded`` and each ``limited_by``
+    follow plan order; ``jobs`` and ``sources`` cover only the remaining
+    targets, exactly as without a limit. With no candidates all four
+    arrays are empty; when every candidate is excluded only ``excluded``
+    is nonempty.
+
     The whole plan, every input path and the output path are validated
     first, exactly like ``query_history``, and then every report is fully
     validated under that entry point's path, UTF-8, structure, name,
     status and strict payload rules — including non-target tasks,
-    overridden older records and reports after the newest record — so an
-    illegal ``reports``, plan or report raises ValueError and no partial
-    result is returned. A bare ``NaN``/``Infinity``/``-Infinity``
-    constant anywhere in any report is rejected while the same words
-    inside strings are fine; syntactically legal JSON numbers are
-    accepted. Nothing is executed, created or written, task inputs are
-    never read, and a report path may equal ``output``.
+    overridden older records and reports after the newest record, with or
+    without a failure limit and whether or not any target survives — so
+    an illegal ``max_failures``, ``reports``, plan or report raises
+    ValueError and no partial result is returned. A bare
+    ``NaN``/``Infinity``/``-Infinity`` constant anywhere in any report is
+    rejected while the same words inside strings are fine; syntactically
+    legal JSON numbers are accepted. Nothing is executed, created or
+    written, task inputs are never read, and a report path may equal
+    ``output``.
     """
     deps_by_name, _report_path = _validate_plan(root, jobs, output)
-    targets, sources = _history_retry_targets(root, jobs, deps_by_name, reports)
-    if not targets:
-        return {"targets": [], "jobs": [], "sources": []}
-    return {"targets": targets,
-            "jobs": _preview_entries(jobs, deps_by_name, targets),
-            "sources": sources}
+    max_failures = _validate_max_failures(max_failures)
+    report_records = _read_history_reports(root, deps_by_name, reports)
+    targets, sources = _history_retry_selection(jobs, reports, report_records)
+    if max_failures is None:
+        if not targets:
+            return {"targets": [], "jobs": [], "sources": []}
+        return {"targets": targets,
+                "jobs": _preview_entries(jobs, deps_by_name, targets),
+                "sources": sources}
+    counts = _failure_counts(jobs, report_records)
+    plan_order = [job["name"] for job in jobs]
+    kept_targets = []
+    kept_sources = []
+    excluded = []
+    for target, source in zip(targets, sources):
+        closure = {target}
+        stack = [target]
+        while stack:
+            node = stack.pop()
+            for dep in deps_by_name[node]:
+                if dep not in closure:
+                    closure.add(dep)
+                    stack.append(dep)
+        limited_by = [name for name in plan_order
+                      if name in closure and counts[name] >= max_failures]
+        if limited_by:
+            excluded.append({"name": target, "failures": counts[target],
+                             "limited_by": limited_by})
+        else:
+            kept_targets.append(target)
+            kept_sources.append(source)
+    entries = (_preview_entries(jobs, deps_by_name, kept_targets)
+               if kept_targets else [])
+    return {"targets": kept_targets, "jobs": entries,
+            "sources": kept_sources, "excluded": excluded}
 
 
 def _changed_targets(root, jobs, deps_by_name, changed_inputs):
@@ -1450,6 +1553,10 @@ def main():
                         metavar="REPORT",
                         help="preview a retry range from the newest matching record "
                              "across REPORT (repeatable, oldest to newest), read-only")
+    parser.add_argument("--max-failures", default=None, metavar="N",
+                        help="with --history-retry, exclude candidates whose "
+                             "consecutive failure count (or a prerequisite's) "
+                             "reached N, a positive integer")
     parser.add_argument("--run-history-retry", action="append", default=None,
                         metavar="REPORT",
                         help="rerun the retry range selected from the newest matching "
@@ -1494,6 +1601,16 @@ def main():
                              "--record-reasons, --preview, --retry-preview, --retry, "
                              "--compare, --explain, --history, --execution, "
                              "--changed or --run-changed")
+        if args.max_failures is not None and args.history_retry is None:
+            raise ValueError("--max-failures can only be used with --history-retry")
+        max_failures = None
+        if args.max_failures is not None:
+            try:
+                max_failures = int(args.max_failures)
+            except ValueError:
+                raise ValueError("--max-failures must be a positive integer")
+            if max_failures < 1:
+                raise ValueError("--max-failures must be a positive integer")
         if args.execution is not None and (args.only is not None or args.record_reasons
                                            or args.preview or args.retry_preview is not None
                                            or args.retry is not None
@@ -1569,7 +1686,8 @@ def main():
             return 0
         if args.history_retry is not None:
             print(json.dumps(preview_history_retry(args.root, jobs, args.output,
-                                                   args.history_retry),
+                                                   args.history_retry,
+                                                   max_failures=max_failures),
                              ensure_ascii=False, indent=2))
             return 0
         if args.compare is not None:

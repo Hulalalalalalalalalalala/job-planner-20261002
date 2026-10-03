@@ -2443,6 +2443,151 @@ class HistoryRetryPreviewTests(unittest.TestCase):
         self.assertEqual(result["targets"], ["broken", "downstream"])
         self.assertEqual((self.root / "same.json").read_text(), before)
 
+    def test_max_failures_excludes_limited_candidates(self):
+        jobs = self._jobs()
+        self._write_report("r1.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "x"},
+            {"name": "lonely", "status": "failed", "error": "y"},
+        ]})
+        self._write_report("r2.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "x"},
+            {"name": "downstream", "status": "blocked",
+             "blocked_by": ["broken"]},
+            {"name": "lonely", "status": "completed", "result": {"lines": 2}},
+        ]})
+        self._write_report("r3.json", {"results": [
+            {"name": "lonely", "status": "failed", "error": "z"},
+        ]})
+        result = preview_history_retry(self.root, jobs, "out.json",
+                                       ["r1.json", "r2.json", "r3.json"],
+                                       max_failures=2)
+        self.assertEqual(set(result), {"targets", "jobs", "sources", "excluded"})
+        # broken failed twice in a row and is excluded at the limit;
+        # downstream is blocked and inherits broken's limit through its
+        # prerequisite; lonely failed, recovered (resetting its count) and
+        # failed once more, so it stays a target.
+        self.assertEqual(result["targets"], ["lonely"])
+        self.assertEqual([s["name"] for s in result["sources"]], ["lonely"])
+        self.assertEqual(result["excluded"], [
+            {"name": "broken", "failures": 2, "limited_by": ["broken"]},
+            {"name": "downstream", "failures": 0, "limited_by": ["broken"]},
+        ])
+        self.assertEqual([row["name"] for row in result["jobs"]], ["lonely"])
+        # Without a limit the same reports keep the original shape.
+        plain = preview_history_retry(self.root, jobs, "out.json",
+                                      ["r1.json", "r2.json", "r3.json"])
+        self.assertEqual(set(plain), {"targets", "jobs", "sources"})
+        self.assertEqual(plain["targets"], ["broken", "downstream", "lonely"])
+
+    def test_max_failures_blocked_and_missing_records_do_not_count(self):
+        jobs = self._jobs()
+        self._write_report("r1.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "x"},
+            {"name": "downstream", "status": "blocked",
+             "blocked_by": ["broken"]},
+        ]})
+        self._write_report("r2.json", {"results": [
+            {"name": "downstream", "status": "blocked",
+             "blocked_by": ["broken"]},
+        ]})
+        result = preview_history_retry(self.root, jobs, "out.json",
+                                       ["r1.json", "r2.json"], max_failures=2)
+        # broken failed once and then went unrecorded (count 1); downstream
+        # was blocked twice, and blocked records never increment.
+        self.assertEqual(result["targets"], ["broken", "downstream"])
+        self.assertEqual(result["excluded"], [])
+        self.assertEqual([row["name"] for row in result["jobs"]],
+                         ["broken", "downstream"])
+
+    def test_max_failures_counts_each_position_of_a_repeated_report(self):
+        jobs = self._jobs()
+        self._write_report("same.json", {"results": [
+            {"name": "healthy", "status": "failed", "error": "x"},
+        ]})
+        result = preview_history_retry(self.root, jobs, "out.json",
+                                       ["same.json", "same.json"],
+                                       max_failures=2)
+        # The repeated path counts at both positions, so the limit is hit;
+        # every candidate excluded leaves only excluded nonempty.
+        self.assertEqual(result, {"targets": [], "jobs": [], "sources": [],
+                                  "excluded": [{"name": "healthy",
+                                                "failures": 2,
+                                                "limited_by": ["healthy"]}]})
+        # A higher limit keeps the same candidate.
+        result = preview_history_retry(self.root, jobs, "out.json",
+                                       ["same.json", "same.json"],
+                                       max_failures=3)
+        self.assertEqual(result["targets"], ["healthy"])
+        self.assertEqual(result["excluded"], [])
+
+    def test_max_failures_indirect_prerequisite_limits_candidate(self):
+        jobs = [
+            {"name": "top", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["mid"]},
+            {"name": "mid", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["base"]},
+            {"name": "base", "operation": "count-lines", "input": "notes.txt"},
+        ]
+        self._write_report("r1.json", {"results": [
+            {"name": "base", "status": "failed", "error": "x"},
+            {"name": "top", "status": "failed", "error": "y"},
+        ]})
+        self._write_report("r2.json", {"results": [
+            {"name": "base", "status": "failed", "error": "x"},
+            {"name": "top", "status": "failed", "error": "y"},
+        ]})
+        result = preview_history_retry(self.root, jobs, "out.json",
+                                       ["r1.json", "r2.json"], max_failures=2)
+        # mid never reaches the limit and is no candidate; top is limited by
+        # itself and its indirect prerequisite base, listed in plan order.
+        self.assertEqual(result["targets"], [])
+        self.assertEqual(result["excluded"], [
+            {"name": "top", "failures": 2, "limited_by": ["top", "base"]},
+            {"name": "base", "failures": 2, "limited_by": ["base"]},
+        ])
+
+    def test_max_failures_with_no_candidates_gives_four_empty_arrays(self):
+        jobs = self._jobs()
+        self._write_report("empty.json", {"results": []})
+        self.assertEqual(preview_history_retry(self.root, jobs, "out.json",
+                                               ["empty.json"], max_failures=1),
+                         {"targets": [], "jobs": [], "sources": [],
+                          "excluded": []})
+
+    def test_max_failures_validation(self):
+        jobs = self._jobs()
+        self._write_report("r.json", {"results": [
+            {"name": "healthy", "status": "failed", "error": "x"},
+        ]})
+        for bad in (0, -1, True, False, 1.5, 2.0, "2"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    preview_history_retry(self.root, jobs, "out.json",
+                                          ["r.json"], max_failures=bad)
+        # Reports are still fully validated when the limit is on.
+        self._write_report("bad.json", {"results": [
+            {"name": "healthy", "status": "completed"}]})
+        with self.assertRaises(ValueError):
+            preview_history_retry(self.root, jobs, "out.json",
+                                  ["r.json", "bad.json"], max_failures=2)
+        with self.assertRaises(ValueError):
+            preview_history_retry(self.root, jobs, "out.json",
+                                  ["missing.json"], max_failures=2)
+
+    def test_max_failures_preview_stays_read_only(self):
+        jobs = self._jobs()
+        self._write_report("r.json", {"results": [
+            {"name": "healthy", "status": "failed", "error": "x"},
+        ]})
+        before = {p.name for p in self.root.iterdir()}
+        result = preview_history_retry(self.root, jobs, "deep/new/out.json",
+                                       ["r.json"], max_failures=1)
+        self.assertEqual(result["targets"], [])
+        self.assertEqual(result["excluded"], [
+            {"name": "healthy", "failures": 1, "limited_by": ["healthy"]}])
+        self.assertFalse((self.root / "deep").exists())
+        self.assertEqual({p.name for p in self.root.iterdir()}, before)
+
     def test_cli_history_retry_flag(self):
         jobs = self._jobs()
         plan = self.root / "plan.json"
@@ -2532,6 +2677,73 @@ class HistoryRetryPreviewTests(unittest.TestCase):
                              capture_output=True, text=True)
         self.assertEqual(run.returncode, 2, run.stderr)
         self.assertEqual(set(json.loads(run.stdout)), {"error"})
+
+    def test_cli_history_retry_max_failures(self):
+        jobs = self._jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        self._write_report("r1.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "x"},
+            {"name": "lonely", "status": "failed", "error": "y"},
+        ]})
+        self._write_report("r2.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "x"},
+        ]})
+        run = subprocess.run(prefix + ["--history-retry", "r1.json",
+                                       "--history-retry", "r2.json",
+                                       "--max-failures", "2"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        payload = json.loads(run.stdout)
+        # broken failed twice in a row and is excluded; lonely failed once
+        # and stays a target. Exit is 0 even with failed records.
+        self.assertEqual(payload["targets"], ["lonely"])
+        self.assertEqual(payload["excluded"], [
+            {"name": "broken", "failures": 2, "limited_by": ["broken"]}])
+        self.assertEqual([row["name"] for row in payload["jobs"]], ["lonely"])
+        self.assertEqual([s["name"] for s in payload["sources"]], ["lonely"])
+        # Without the option the original three-field shape is kept.
+        run = subprocess.run(prefix + ["--history-retry", "r1.json",
+                                       "--history-retry", "r2.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        payload = json.loads(run.stdout)
+        self.assertEqual(set(payload), {"targets", "jobs", "sources"})
+        self.assertEqual(payload["targets"], ["broken", "lonely"])
+        self.assertFalse((self.root / ".results").exists())
+
+    def test_cli_max_failures_conflicts_and_errors(self):
+        jobs = self._jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        self._write_report("r.json", {"results": []})
+        marker = self.root / "keep.json"
+        marker.write_text("KEEP", encoding="utf-8")
+        for extra in (# Not combined with --history-retry.
+                      ["--max-failures", "2"],
+                      ["--max-failures", "2", "--preview"],
+                      ["--max-failures", "2", "--only", "healthy"],
+                      ["--max-failures", "2", "--retry", "r.json"],
+                      ["--max-failures", "2", "--run-history-retry", "r.json"],
+                      ["--max-failures", "2", "--history", "r.json"],
+                      # Not a positive integer.
+                      ["--history-retry", "r.json", "--max-failures", "0"],
+                      ["--history-retry", "r.json", "--max-failures", "-2"],
+                      ["--history-retry", "r.json", "--max-failures", "abc"],
+                      ["--history-retry", "r.json", "--max-failures", "1.5"],
+                      # The original --history-retry conflicts still apply.
+                      ["--history-retry", "r.json", "--max-failures", "2",
+                       "--only", "healthy"],
+                      ["--history-retry", "r.json", "--max-failures", "2",
+                       "--preview"]):
+            run = subprocess.run(prefix + extra, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, (extra, run.stderr))
+            self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self.assertEqual(marker.read_text(), "KEEP")
 
 
 class RunHistoryRetryTests(unittest.TestCase):

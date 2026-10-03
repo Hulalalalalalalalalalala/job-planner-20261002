@@ -65,6 +65,17 @@ reports, escaping paths or a bad plan exit 2 with an error JSON and no
 partial result. Nothing is read besides the plan and reports, a report
 may equal --output, and nothing is created or written. Cannot combine with
 --only, --record-reasons or any other execution, preview or query option.
+Add --max-failures N (a positive integer, only with --history-retry) to
+limit consecutive failures: each task counts failed records since its last
+completed record (completed resets, blocked and missing records change
+nothing, repeated reports count per position), and a candidate whose own
+count or any prerequisite's count reached N is excluded instead of
+targeted. The output gains an "excluded" array with name, failures and
+limited_by per excluded candidate (plan order, self included when it hit
+the limit); targets, jobs and sources cover only the remaining targets.
+No candidates prints four empty arrays; all excluded leaves only
+"excluded" nonempty. A missing, zero, negative or non-integer N, or
+--max-failures without --history-retry, exits 2 with an error JSON.
 
 History retry run
 python3 job_planner.py samples/plan-dependencies.json --run-history-retry r1.json --run-history-retry r2.json --output .results/deps.json
