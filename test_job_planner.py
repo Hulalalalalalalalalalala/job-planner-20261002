@@ -1,10 +1,13 @@
 import json
+import os
+import stat
 from decimal import Decimal
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from job_planner import (compare_reports, execute_job, explain_report, local_path,
                          preview_changes, preview_history_retry, preview_plan,
                          preview_retry, query_execution, query_history, run_changes,
@@ -4095,6 +4098,168 @@ class DeepResultTests(unittest.TestCase):
             capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(json.loads(run.stdout)["jobs"][0]["change"], "unchanged")
+
+
+class AtomicSaveTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "notes.txt").write_text("one\ntwo\n", encoding="utf-8")
+        self.jobs = [{"name": "notes", "operation": "count-lines",
+                      "input": "notes.txt"}]
+        (self.root / "plan.json").write_text(json.dumps({"jobs": self.jobs}))
+        self.prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                       "--root", str(self.root)]
+
+    def _tree(self):
+        return sorted(str(path.relative_to(self.root))
+                      for path in self.root.rglob("*"))
+
+    def test_successful_run_writes_only_the_report(self):
+        results = run_plan(self.root, self.jobs, "deep/out.json")
+        self.assertEqual([row["status"] for row in results], ["completed"])
+        report = json.loads((self.root / "deep/out.json").read_text(encoding="utf-8"))
+        self.assertEqual(report, {"results": results})
+        # No temporary or extra files remain next to the report.
+        self.assertEqual(self._tree(),
+                         ["deep", "deep/out.json", "notes.txt", "plan.json"])
+
+    def test_unencodable_report_raises_valueerror_and_touches_nothing(self):
+        # Serialization fails before the filesystem is touched.
+        with mock.patch("job_planner.json.dumps",
+                        side_effect=TypeError("circular reference")):
+            with self.assertRaises(ValueError):
+                run_plan(self.root, self.jobs, "deep/out.json")
+        self.assertEqual(self._tree(), ["notes.txt", "plan.json"])
+        # An existing output keeps its exact bytes, and UTF-8 encoding
+        # failures (a lone surrogate) are ValueError too.
+        marker = b'{"old": true}\x00\xff\n'
+        (self.root / "out.json").write_bytes(marker)
+        with mock.patch("job_planner.json.dumps", return_value="\ud800"):
+            with self.assertRaises(ValueError):
+                run_plan(self.root, self.jobs, "out.json")
+        self.assertEqual((self.root / "out.json").read_bytes(), marker)
+        self.assertEqual(self._tree(), ["notes.txt", "out.json", "plan.json"])
+
+    def test_replace_failure_preserves_previous_output_byte_for_byte(self):
+        marker = b"KEEP\x00\xff partial writes must not appear"
+        (self.root / "out.json").write_bytes(marker)
+        # The new content is fully staged, then the replace itself fails.
+        with mock.patch("job_planner.os.replace",
+                        side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                run_plan(self.root, self.jobs, "out.json")
+            with self.assertRaises(OSError):
+                run_plan(self.root, self.jobs, "out.json", record_reasons=True)
+        self.assertEqual((self.root / "out.json").read_bytes(), marker)
+        # The staged temporary file is cleaned up.
+        self.assertEqual(self._tree(), ["notes.txt", "out.json", "plan.json"])
+
+    def test_failed_save_without_previous_output_leaves_no_file(self):
+        with mock.patch("job_planner.os.replace",
+                        side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                run_plan(self.root, self.jobs, "deep/out.json")
+        self.assertFalse((self.root / "deep/out.json").exists())
+        # Only the newly created empty parent directory may remain.
+        self.assertEqual(self._tree(), ["deep", "notes.txt", "plan.json"])
+
+    def test_output_directory_raises_oserror_and_is_preserved(self):
+        (self.root / "out.json").mkdir()
+        (self.root / "out.json/inner.txt").write_text("x", encoding="utf-8")
+        with self.assertRaises(OSError):
+            run_plan(self.root, self.jobs, "out.json")
+        self.assertTrue((self.root / "out.json").is_dir())
+        self.assertEqual([p.name for p in (self.root / "out.json").iterdir()],
+                         ["inner.txt"])
+        self.assertEqual((self.root / "out.json/inner.txt").read_text(), "x")
+
+    def test_output_parent_is_file_raises_oserror_and_touches_nothing(self):
+        (self.root / "blocker").write_text("x", encoding="utf-8")
+        with self.assertRaises(OSError):
+            run_plan(self.root, self.jobs, "blocker/out.json")
+        self.assertEqual((self.root / "blocker").read_text(), "x")
+        self.assertEqual(self._tree(), ["blocker", "notes.txt", "plan.json"])
+
+    def test_symlink_output_updates_target_and_keeps_link(self):
+        (self.root / "sub").mkdir()
+        (self.root / "sub/real.json").write_text("old", encoding="utf-8")
+        (self.root / "link.json").symlink_to("sub/real.json")
+        run_plan(self.root, self.jobs, "link.json")
+        self.assertTrue((self.root / "link.json").is_symlink())
+        report = json.loads((self.root / "sub/real.json").read_text(encoding="utf-8"))
+        self.assertEqual([row["name"] for row in report["results"]], ["notes"])
+        # A failed save keeps the resolved target's bytes and the link.
+        (self.root / "sub/real.json").write_bytes(b"KEEP")
+        with mock.patch("job_planner.os.replace",
+                        side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                run_plan(self.root, self.jobs, "link.json")
+        self.assertTrue((self.root / "link.json").is_symlink())
+        self.assertEqual((self.root / "sub/real.json").read_bytes(), b"KEEP")
+        self.assertEqual(sorted(p.name for p in (self.root / "sub").iterdir()),
+                         ["real.json"])
+
+    def test_successful_save_keeps_existing_file_permissions(self):
+        out = self.root / "out.json"
+        out.write_text("old", encoding="utf-8")
+        os.chmod(out, 0o640)
+        run_plan(self.root, self.jobs, "out.json")
+        self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o640)
+        report = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual([row["name"] for row in report["results"]], ["notes"])
+
+    def test_retry_failed_save_keeps_history_queryable(self):
+        jobs = [{"name": "broken", "operation": "shell", "input": "notes.txt"}]
+        run_plan(self.root, jobs, "r.json")
+        before = (self.root / "r.json").read_bytes()
+        with mock.patch("job_planner.os.replace",
+                        side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                run_retry(self.root, jobs, "r.json", "r.json")
+        # The historical report is untouched and still selects its targets.
+        self.assertEqual((self.root / "r.json").read_bytes(), before)
+        self.assertEqual(preview_retry(self.root, jobs, "r.json", "r.json")["targets"],
+                         ["broken"])
+        # A successful save replaces it with exactly this run's results.
+        results = run_retry(self.root, jobs, "r.json", "r.json")
+        self.assertEqual(json.loads((self.root / "r.json").read_text(encoding="utf-8")),
+                         {"results": results})
+
+    def test_history_retry_and_changes_failed_save_preserve_output(self):
+        marker = b"KEEP"
+        (self.root / "out.json").write_bytes(marker)
+        (self.root / "r.json").write_text(json.dumps({"results": [
+            {"name": "notes", "status": "failed", "error": "x"}]}), encoding="utf-8")
+        with mock.patch("job_planner.os.replace",
+                        side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                run_history_retry(self.root, self.jobs, "out.json", ["r.json"])
+            with self.assertRaises(OSError):
+                run_changes(self.root, self.jobs, "out.json", ["notes.txt"])
+        self.assertEqual((self.root / "out.json").read_bytes(), marker)
+        self.assertEqual(self._tree(),
+                         ["notes.txt", "out.json", "plan.json", "r.json"])
+
+    def test_cli_save_failure_prints_error_only_and_exits_2(self):
+        # The output's parent is a plain file: saving fails after the run.
+        (self.root / "blocker").write_text("x", encoding="utf-8")
+        run = subprocess.run(self.prefix + ["--output", "blocker/out.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self.assertNotIn("completed", run.stdout)
+        self.assertEqual((self.root / "blocker").read_text(), "x")
+        self.assertFalse((self.root / "blocker/out.json").exists())
+        # An existing output (here a directory) is preserved as well.
+        (self.root / "dir.json").mkdir()
+        run = subprocess.run(self.prefix + ["--output", "dir.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self.assertTrue((self.root / "dir.json").is_dir())
+        self.assertEqual(list((self.root / "dir.json").iterdir()), [])
 
 
 if __name__ == "__main__":

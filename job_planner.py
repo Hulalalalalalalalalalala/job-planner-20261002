@@ -4,6 +4,9 @@ import csv
 import hashlib
 import io
 import json
+import os
+import stat
+import tempfile
 from decimal import Decimal
 from pathlib import Path
 
@@ -1038,6 +1041,57 @@ def preview_changes(root, jobs, output, changed_inputs):
     return {"targets": targets, "jobs": entries}
 
 
+def _save_report(report_path, report):
+    """Serialize ``report`` and atomically replace the output file with it.
+
+    The report is fully serialized and UTF-8 encoded before the filesystem
+    is touched: a report that cannot become one complete UTF-8 JSON
+    document raises ValueError and nothing is created, changed or removed.
+    The encoded bytes are then written to a temporary file in the same
+    directory and moved over the target with ``os.replace``, so a
+    filesystem error while creating the directory, saving the content or
+    replacing the output raises OSError (including when the output path
+    already is a directory) with the pre-run output file preserved
+    byte-for-byte — or still absent when there was none — and no partial
+    or extra files left behind; empty parent directories created for the
+    attempt may remain. ``report_path`` is already symlink-resolved, so a
+    legal in-root symlink output updates the resolved target while the
+    link itself is kept. The saved file keeps the permissions a plain
+    overwrite would have: an existing output's mode is preserved and a
+    new file follows the process umask.
+    """
+    try:
+        data = (json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"report cannot be encoded as UTF-8 JSON: {exc}") from exc
+    try:
+        previous_mode = stat.S_IMODE(os.stat(report_path).st_mode)
+    except OSError:
+        previous_mode = None
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=report_path.parent,
+                                     prefix=report_path.name + ".",
+                                     suffix=".tmp")
+    try:
+        if previous_mode is not None:
+            os.fchmod(fd, previous_mode)
+        else:
+            # mkstemp forces 0600; a fresh output gets the same mode a
+            # plain create would, 0666 minus the process umask.
+            umask = os.umask(0)
+            os.umask(umask)
+            os.fchmod(fd, 0o666 & ~umask)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(temporary, report_path)
+    except OSError:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
 def _run_selected(root, selected, deps_by_name, report_path, execution=None):
     """Execute an already-selected plan-ordered job list and write its report.
 
@@ -1047,7 +1101,10 @@ def _run_selected(root, selected, deps_by_name, report_path, execution=None):
     input, and only this run's results drive dependency decisions. The
     report contains exactly these results, replacing any prior content;
     with ``execution`` set it is recorded alongside them as the top-level
-    ``execution`` object explaining why this run happened.
+    ``execution`` object explaining why this run happened. Saving follows
+    ``_save_report``: only a successful save means the new results have
+    fully replaced the old ones, and a failed save raises with the
+    previous output file (or its absence) unchanged.
     """
     results = []
     records = {}
@@ -1073,8 +1130,7 @@ def _run_selected(root, selected, deps_by_name, report_path, execution=None):
     report = {"results": results}
     if execution is not None:
         report["execution"] = execution
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _save_report(report_path, report)
     return results
 
 
@@ -1133,6 +1189,18 @@ def run_plan(root, jobs, output, targets=None, record_reasons=False):
     returned list, CLI statistics and exit codes are unchanged and only
     ``output`` is ever written; with an empty scope no report is written
     and no ``execution`` is recorded.
+
+    Saving the report is atomic: a report that cannot be encoded as one
+    complete UTF-8 JSON document raises ValueError, and a filesystem error
+    while creating the output directory, saving the content or replacing
+    the output raises OSError (the output path already being a directory
+    included) after tasks have run. Either failure leaves the pre-run
+    output file byte-for-byte intact — or still absent when there was
+    none — with no partial or extra files left behind (empty parent
+    directories created for the attempt may remain); executed tasks are
+    not undone and a failed save never turns their results into failures.
+    Only a successful save means the new results have fully replaced the
+    old ones.
     """
     _require_bool(record_reasons)
     deps_by_name, report_path = _validate_plan(root, jobs, output)
@@ -1168,9 +1236,16 @@ def run_retry(root, jobs, output, report, record_reasons=False):
     exactly as in ``preview_retry`` — including a bare
     ``NaN``/``Infinity``/``-Infinity`` constant anywhere in the report,
     which stops the retry before any task input is read, directory
-    created or file written (the same words inside strings are fine) —
-    and creating the output directory or writing the report may raise
-    OSError after tasks have run.
+    created or file written (the same words inside strings are fine).
+    Saving follows ``run_plan``'s atomic rule: an unencodable report
+    raises ValueError and a filesystem error while creating the output
+    directory, saving the content or replacing the output raises OSError,
+    in both cases after tasks have run, with the pre-run output file
+    preserved byte-for-byte (or still absent when there was none), no
+    partial or extra files left behind and executed tasks not undone — so
+    when ``report`` equals ``output`` the historical report stays
+    queryable after a failed save, and only a successful save replaces it
+    with this run's results.
 
     With ``record_reasons=True`` and at least one retry target, the
     written report additionally carries the top-level ``execution``
@@ -1228,9 +1303,16 @@ def run_history_retry(root, jobs, output, reports, record_reasons=False):
     validated under ``preview_history_retry``'s path, UTF-8, structure,
     name, status and strict payload rules — including out-of-scope and
     overridden older records — so an illegal ``reports``, plan or report
-    raises ValueError before anything runs and no file changes. Creating
-    the output directory or writing the report may raise OSError after
-    tasks have run; executed tasks are not undone.
+    raises ValueError before anything runs and no file changes. Saving
+    follows ``run_plan``'s atomic rule: an unencodable report raises
+    ValueError and a filesystem error while creating the output
+    directory, saving the content or replacing the output raises OSError,
+    in both cases after tasks have run, with the pre-run output file
+    preserved byte-for-byte (or still absent when there was none), no
+    partial or extra files left behind and executed tasks not undone — so
+    a historical report aliasing ``output`` stays queryable after a
+    failed save, and only a successful save replaces it with this run's
+    results.
 
     With ``record_reasons=True`` and at least one target, the written
     report additionally carries the top-level ``execution`` object with
@@ -1282,9 +1364,13 @@ def run_changes(root, jobs, output, changed_inputs, record_reasons=False):
     report. The whole plan (including unselected branches and an empty
     scope) and the output path are validated before the scope is chosen;
     any plan, dependency, path or ``changed_inputs`` violation raises
-    ValueError before anything runs. Creating the output directory or
-    writing the report may raise OSError after tasks have run; executed
-    tasks are not undone.
+    ValueError before anything runs. Saving follows ``run_plan``'s atomic
+    rule: an unencodable report raises ValueError and a filesystem error
+    while creating the output directory, saving the content or replacing
+    the output raises OSError, in both cases after tasks have run, with
+    the pre-run output file preserved byte-for-byte (or still absent when
+    there was none), no partial or extra files left behind and executed
+    tasks not undone.
 
     With ``record_reasons=True`` and at least one target, the written
     report additionally carries the top-level ``execution`` object with

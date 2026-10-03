@@ -42,8 +42,10 @@ Ordering, failures and blocked_by follow a normal run, judged on this run's
 results only. The report at --output holds just this run's records; report may
 equal --output (targets use the pre-overwrite content). No targets prints
 {"completed":0,"failed":0}, exits 0 and touches no files. Bad reports and
-plans exit 2 with an error JSON; output write failures exit 2 without undoing
-finished tasks. Cannot combine with --only, --preview or --retry-preview.
+plans exit 2 with an error JSON; save failures exit 2 with an error-only
+JSON and no statistics, keep the previous report byte-for-byte (or absent)
+and do not undo finished tasks. Cannot combine with --only, --preview or
+--retry-preview.
 
 History retry preview
 python3 job_planner.py samples/plan-dependencies.json --history-retry r1.json --history-retry r2.json --output .results/deps.json
@@ -76,8 +78,9 @@ a normal run, judged on this run's results only. The report at --output
 holds just this run's records; a report may equal --output or alias the
 same file (the range uses the pre-overwrite content). No targets prints
 {"completed":0,"failed":0}, exits 0 and touches no files. Bad reports,
-plans or option combinations exit 2 with an error JSON; output write
-failures exit 2 without undoing finished tasks. --record-reasons is
+plans or option combinations exit 2 with an error JSON; save failures exit
+2 with an error-only JSON and no statistics, keep the previous report
+byte-for-byte (or absent) and do not undo finished tasks. --record-reasons is
 allowed and records mode "retry" with the preview's targets/jobs (no
 sources); every other execution, preview or query option conflicts.
 
@@ -146,7 +149,9 @@ this run's results only; the report at --output holds just this run's
 records and out-of-scope tasks are never read or recorded. No match (or
 no paths) prints {"completed":0,"failed":0}, exits 0 and touches no
 files. The whole plan is validated first; failures exit 2 with an error
-JSON, and output write failures exit 2 without undoing finished tasks.
+JSON, and save failures exit 2 with an error-only JSON and no statistics,
+keep the previous report byte-for-byte (or absent) and do not undo
+finished tasks.
 Cannot combine with --only, --preview, --retry-preview, --retry,
 --compare, --explain, --history or --changed.
 
@@ -172,6 +177,21 @@ boolean, and --record-reasons cannot be combined with --preview,
 --retry-preview, --changed, --compare, --explain or --history (error
 JSON, exit 2). Existing readers ignore execution as an extra field and
 old reports need no changes.
+
+Report saving
+Every run mode saves atomically: the new report is fully serialized and
+UTF-8 encoded first, then staged and moved over --output in one replace.
+A report that cannot be encoded as one complete UTF-8 JSON document fails
+with an error JSON and exit 2 before the filesystem is touched; a
+filesystem error while creating the directory, saving the content or
+replacing the output (including --output already being a directory) also
+exits 2 with an error-only JSON and no statistics. Either way the previous
+report keeps its exact bytes — or stays absent when there was none — no
+partial or extra files remain (empty new parent directories may), and
+finished tasks are not rolled back. Only a successful save replaces the
+old report, so a historical report that is also --output stays queryable
+after a failed save; an in-root symlink output updates the resolved
+target and keeps the link.
 
 Smoke Test
 python3 -B -m unittest -v
