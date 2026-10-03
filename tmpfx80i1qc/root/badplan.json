@@ -1,0 +1,1 @@
+{"jobs": [{"name": "bad", "operation": "count-lines", "input": "bad\ud800.txt"}]}

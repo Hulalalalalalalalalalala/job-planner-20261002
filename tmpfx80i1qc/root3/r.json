@@ -1,0 +1,27 @@
+{
+  "results": [
+    {
+      "name": "notes",
+      "status": "completed",
+      "result": {
+        "lines": 1
+      }
+    }
+  ],
+  "execution": {
+    "mode": "retry",
+    "targets": [
+      "notes"
+    ],
+    "jobs": [
+      {
+        "name": "notes",
+        "depends_on": [],
+        "reason": "target",
+        "required_by": [
+          "notes"
+        ]
+      }
+    ]
+  }
+}

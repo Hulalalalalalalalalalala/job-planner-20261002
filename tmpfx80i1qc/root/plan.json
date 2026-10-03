@@ -1,0 +1,1 @@
+{"jobs": [{"name": "notes", "operation": "count-lines", "input": "notes.txt"}]}
