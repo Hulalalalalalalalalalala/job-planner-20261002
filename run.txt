@@ -64,6 +64,32 @@ partial result. Nothing is read besides the plan and reports, a report
 may equal --output, and nothing is created or written. Cannot combine with
 --only, --record-reasons or any other execution, preview or query option.
 
+History retry
+python3 job_planner.py samples/plan-dependencies.json --run-history-retry r1.json --run-history-retry r2.json --output .results/deps.json
+Executes the same range the history retry preview would show: reports are
+read oldest to newest (repeats keep separate positions, nothing is sorted
+or scanned), each task is judged by its last recorded status — a later
+missing record never clears an old one — and only tasks latest failed or
+blocked become targets, in plan order. Every prerequisite is re-executed
+(even completed or never-recorded ones, shared once) and unrelated
+branches are never read or recorded. Ordering, failures and blocked_by
+follow a normal run judged on this run's results only (old error text is
+never reused); the report at --output holds just this run's records, and a
+report path (or an alias of the same file) may equal --output since the
+range uses the pre-overwrite content. No targets prints
+{"completed":0,"failed":0}, exits 0, reads no task inputs and touches no
+files; otherwise the counts and exit code match a normal run (0 or 1).
+The whole plan and every report are validated first, strictly like the
+history retry preview (including out-of-scope and overridden records;
+NaN/Infinity/-Infinity rejected anywhere): failures exit 2 with an
+error-only JSON before anything runs, and output write failures exit 2
+without undoing finished tasks. --record-reasons may be added: the report
+then records an execution object with mode retry, targets and jobs taken
+from the history preview (sources are not saved), readable via
+--execution. A non-boolean record_reasons is rejected. Cannot combine with
+--only, --preview, --retry-preview, --retry, --compare, --explain,
+--history, --history-retry, --execution, --changed or --run-changed.
+
 Compare
 python3 job_planner.py samples/plan-dependencies.json --compare .results/deps.json .results/deps.json
 Reads two reports without running anything and prints {"jobs": [...]}, one
@@ -139,15 +165,17 @@ Adds an optional record of why the run happened: the report at --output
 gains one top-level "execution" object (only when at least one task
 runs), with exactly mode, targets and jobs. mode is all for a full run,
 only for --only selections (even selecting every job), retry for
---retry and changes for --run-changed. targets are this run's targets
-in plan order: every job, the explicit targets, the old report's
-failed/blocked jobs, or the directly changed tasks plus their
-downstream dependants. jobs use the corresponding preview's fields and
-semantics (--preview, --retry-preview or --changed), one entry per
-processed job in the same names and order as results, shared
-prerequisites once; failed and blocked jobs keep their selection
-reasons and results never rewrite them. With --retry onto the same
-file, reasons come from the pre-overwrite content. results, the printed
+--retry and --run-history-retry, and changes for --run-changed. targets
+are this run's targets in plan order: every job, the explicit targets,
+the failed/blocked tasks selected from the report(s), or the directly
+changed tasks plus their downstream dependants. jobs use the
+corresponding preview's fields and semantics (--preview,
+--retry-preview, the history retry preview minus sources, or
+--changed), one entry per processed job in the same names and order as
+results, shared prerequisites once; failed and blocked jobs keep their
+selection reasons and results never rewrite them. With --retry or
+--run-history-retry onto the same file, reasons come from the
+pre-overwrite content. results, the printed
 counts and the exit code are unchanged and nothing but --output is
 written; no retry targets or no changed match still writes no report
 and creates no directory. The API option record_reasons accepts only a
@@ -159,5 +187,6 @@ old reports need no changes.
 Smoke Test
 python3 -B -m unittest -v
 Checks real file operations, recorded errors, directory boundaries, symlinks,
-dependency validation/blocking, plan, retry and history-retry previews, manual retries,
-change-driven runs, report comparison, failure explanation and the CLI.
+dependency validation/blocking, plan, retry and history-retry previews,
+single-report and history manual retries, change-driven runs, report
+comparison, failure explanation and the CLI.

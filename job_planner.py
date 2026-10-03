@@ -660,10 +660,7 @@ def query_history(root, jobs, output, reports, targets=None):
     and a report path may equal ``output``.
     """
     deps_by_name, _report_path = _validate_plan(root, jobs, output)
-    if not isinstance(reports, list) or not reports:
-        raise ValueError("reports must be a nonempty list of report paths")
-    if any(not isinstance(report, str) or not report.strip() for report in reports):
-        raise ValueError("report paths must be nonblank strings")
+    _validate_reports_arg(reports)
     if targets is not None:
         _validate_target_names(jobs, targets)
         wanted = list(targets)
@@ -867,6 +864,47 @@ def preview_retry(root, jobs, output, report):
     return {"targets": targets, "jobs": _preview_entries(jobs, deps_by_name, targets)}
 
 
+def _validate_reports_arg(reports):
+    """Validate the ``reports`` list shared by history readers and retries.
+
+    Must be a nonempty list of nonblank root-relative path strings;
+    repeats are allowed and keep separate positions. Any violation
+    raises ValueError.
+    """
+    if not isinstance(reports, list) or not reports:
+        raise ValueError("reports must be a nonempty list of report paths")
+    if any(not isinstance(report, str) or not report.strip() for report in reports):
+        raise ValueError("report paths must be nonblank strings")
+
+
+def _history_targets(root, jobs, deps_by_name, reports):
+    """Read the reports oldest-to-newest; return (latest, targets).
+
+    Every report is fully read and validated under the compare report's
+    strict path, UTF-8, structure, name, status and payload rules —
+    including non-target tasks and overridden older records — before any
+    scope is returned. Each task is described by the last report (highest
+    index) that records it; a later report missing the task never clears
+    an older status. The shared result drives both the history retry
+    preview and the history retry execution so their targets and recorded
+    reasons can never drift.
+    """
+    _validate_reports_arg(reports)
+    latest = {}
+    for index, report in enumerate(reports):
+        records = _read_compare_report(root, report, deps_by_name,
+                                       exact_numbers=True)
+        for name, record in records.items():
+            latest[name] = {"status": record["status"],
+                            "report": report, "index": index}
+    targets = []
+    for job in jobs:
+        source = latest.get(job["name"])
+        if source is not None and source["status"] in ("failed", "blocked"):
+            targets.append(job["name"])
+    return latest, targets
+
+
 def preview_history_retry(root, jobs, output, reports):
     """Preview a retry range from several historical reports, read-only.
 
@@ -905,25 +943,12 @@ def preview_history_retry(root, jobs, output, reports):
     never read, and a report path may equal ``output``.
     """
     deps_by_name, _report_path = _validate_plan(root, jobs, output)
-    if not isinstance(reports, list) or not reports:
-        raise ValueError("reports must be a nonempty list of report paths")
-    if any(not isinstance(report, str) or not report.strip() for report in reports):
-        raise ValueError("report paths must be nonblank strings")
-    latest = {}
-    for index, report in enumerate(reports):
-        records = _read_compare_report(root, report, deps_by_name,
-                                       exact_numbers=True)
-        for name, record in records.items():
-            latest[name] = {"status": record["status"],
-                            "report": report, "index": index}
-    targets = []
+    latest, targets = _history_targets(root, jobs, deps_by_name, reports)
     sources = []
-    for job in jobs:
-        source = latest.get(job["name"])
-        if source is not None and source["status"] in ("failed", "blocked"):
-            targets.append(job["name"])
-            sources.append({"name": job["name"], "status": source["status"],
-                            "report": source["report"], "index": source["index"]})
+    for name in targets:
+        source = latest[name]
+        sources.append({"name": name, "status": source["status"],
+                        "report": source["report"], "index": source["index"]})
     if not targets:
         return {"targets": [], "jobs": [], "sources": []}
     return {"targets": targets,
@@ -1236,6 +1261,73 @@ def run_changes(root, jobs, output, changed_inputs, record_reasons=False):
     return _run_selected(root, selected, deps_by_name, report_path, execution)
 
 
+def run_history_retry(root, jobs, output, reports, record_reasons=False):
+    """Execute the retry range ``preview_history_retry`` describes.
+
+    Target selection mirrors ``preview_history_retry`` exactly: ``reports``
+    is a nonempty list of nonblank root-relative report paths, ordered
+    oldest to newest by the caller, with repeats keeping separate later
+    positions and no other file scanned; each task is judged by the last
+    report containing a record of it — a later report missing the task
+    never clears an older status — and tasks whose latest record is
+    ``failed`` or ``blocked`` become targets in current plan order. The
+    run covers the targets plus every direct and indirect prerequisite —
+    prerequisites that completed in history or were never recorded are
+    re-executed too, shared prerequisites run once, and unrelated branches
+    are neither read nor recorded.
+
+    Dependency decisions use only this run's results: file-read failures,
+    unknown operations and invalid contents are recorded ``failed`` with
+    the historical error text never reused, independent branches keep
+    running, blocked tasks never read their input and ``blocked_by`` lists
+    every failed or blocked direct dependency in declaration order. The
+    returned list holds this run's records in actual processing order and
+    the report at ``output`` contains exactly those records under
+    ``results``; old records are never mixed in. A report path (or several
+    paths that are aliases of the same file) may equal ``output``: the
+    range is taken entirely from the content read before the overwrite.
+
+    With no targets the empty list is returned without reading task
+    inputs, creating directories or touching any report, and an existing
+    ``output`` is left byte-for-byte untouched.
+
+    The whole plan — names, dependencies, every input path and output
+    protection, including unselected branches and an empty scope — is
+    validated first, then every report is fully validated under the
+    history preview's path, UTF-8, structure, name, status and strict
+    payload rules — including non-target tasks, overridden older records
+    and reports after the newest record — so an illegal ``reports``, plan
+    or report raises ValueError before any task input is read, directory
+    created or file changed. A bare ``NaN``/``Infinity``/``-Infinity``
+    constant anywhere in any report rejects the run while the same words
+    inside strings are fine. Creating the output directory or writing the
+    report may raise OSError after tasks have run; executed tasks are not
+    undone.
+
+    With ``record_reasons=True`` and at least one target, the written
+    report additionally carries the top-level ``execution`` object with
+    ``mode`` ``"retry"``; ``targets`` and ``jobs`` are exactly the history
+    preview's (``sources`` is not saved) and ``jobs`` match ``results`` in
+    name and order. The reasons are computed from the content read before
+    any overwrite, so they still reflect the full history when a report
+    equals ``output``; outcomes of this run never rewrite them. With no
+    targets nothing is written and no ``execution`` is recorded.
+    ``record_reasons`` must be a bool; other values raise ValueError.
+    """
+    _require_bool(record_reasons)
+    deps_by_name, report_path = _validate_plan(root, jobs, output)
+    _latest, targets = _history_targets(root, jobs, deps_by_name, reports)
+    if not targets:
+        return []
+    selected = _select_jobs(jobs, targets)
+    execution = None
+    if record_reasons:
+        preview = preview_history_retry(root, jobs, output, reports)
+        execution = {"mode": "retry", "targets": preview["targets"],
+                     "jobs": preview["jobs"]}
+    return _run_selected(root, selected, deps_by_name, report_path, execution)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("plan")
@@ -1259,6 +1351,10 @@ def main():
                         metavar="REPORT",
                         help="preview a retry range from the newest matching record "
                              "across REPORT (repeatable, oldest to newest), read-only")
+    parser.add_argument("--run-history-retry", action="append", default=None,
+                        metavar="REPORT",
+                        help="run the retry range --history-retry would preview from "
+                             "REPORT (repeatable, oldest to newest)")
     parser.add_argument("--execution", metavar="REPORT",
                         help="print the execution reasons recorded in REPORT, read-only")
     parser.add_argument("--changed", action="append", default=None, metavar="PATH",
@@ -1279,11 +1375,26 @@ def main():
                                                or args.history is not None
                                                or args.execution is not None
                                                or args.changed is not None
-                                               or args.run_changed is not None):
+                                               or args.run_changed is not None
+                                               or args.run_history_retry is not None):
             raise ValueError("--history-retry cannot be combined with --only, "
                              "--record-reasons, --preview, --retry-preview, --retry, "
                              "--compare, --explain, --history, --execution, "
-                             "--changed or --run-changed")
+                             "--changed, --run-changed or --run-history-retry")
+        if args.run_history_retry is not None and (args.only is not None
+                                                   or args.preview
+                                                   or args.retry_preview is not None
+                                                   or args.retry is not None
+                                                   or args.compare is not None
+                                                   or args.explain is not None
+                                                   or args.history is not None
+                                                   or args.execution is not None
+                                                   or args.changed is not None
+                                                   or args.run_changed is not None):
+            raise ValueError("--run-history-retry cannot be combined with --only, "
+                             "--preview, --retry-preview, --retry, --compare, "
+                             "--explain, --history, --execution, --changed or "
+                             "--run-changed")
         if args.execution is not None and (args.only is not None or args.record_reasons
                                            or args.preview or args.retry_preview is not None
                                            or args.retry is not None
@@ -1291,10 +1402,12 @@ def main():
                                            or args.explain is not None
                                            or args.history is not None
                                            or args.changed is not None
-                                           or args.run_changed is not None):
+                                           or args.run_changed is not None
+                                           or args.run_history_retry is not None):
             raise ValueError("--execution cannot be combined with --only, "
                              "--record-reasons, --preview, --retry-preview, --retry, "
-                             "--compare, --explain, --history, --changed or --run-changed")
+                             "--compare, --explain, --history, --changed, "
+                             "--run-changed or --run-history-retry")
         if args.record_reasons and (args.preview or args.retry_preview is not None
                                     or args.changed is not None or args.compare is not None
                                     or args.explain is not None or args.history is not None):
@@ -1306,45 +1419,57 @@ def main():
                                              or args.compare is not None
                                              or args.explain is not None
                                              or args.history is not None
-                                             or args.changed is not None):
+                                             or args.changed is not None
+                                             or args.run_history_retry is not None):
             raise ValueError("--run-changed cannot be combined with --only, --preview, "
                              "--retry-preview, --retry, --compare, --explain, "
-                             "--history or --changed")
+                             "--history, --changed or --run-history-retry")
         if args.changed is not None and (args.only is not None or args.preview
                                          or args.retry_preview is not None
                                          or args.retry is not None
                                          or args.compare is not None
                                          or args.explain is not None
-                                         or args.history is not None):
+                                         or args.history is not None
+                                         or args.run_history_retry is not None):
             raise ValueError("--changed cannot be combined with --only, --preview, "
-                             "--retry-preview, --retry, --compare, --explain or --history")
+                             "--retry-preview, --retry, --compare, --explain, "
+                             "--history or --run-history-retry")
         if args.history is not None and (args.preview or args.retry_preview is not None
                                          or args.retry is not None
                                          or args.compare is not None
-                                         or args.explain is not None):
+                                         or args.explain is not None
+                                         or args.run_history_retry is not None):
             raise ValueError("--history cannot be combined with --preview, "
-                             "--retry-preview, --retry, --compare or --explain")
+                             "--retry-preview, --retry, --compare, --explain or "
+                             "--run-history-retry")
         if args.explain is not None and (args.only is not None or args.preview
                                          or args.retry_preview is not None
                                          or args.retry is not None
                                          or args.compare is not None
-                                         or args.history is not None):
+                                         or args.history is not None
+                                         or args.run_history_retry is not None):
             raise ValueError("--explain cannot be combined with --only, --preview, "
-                             "--retry-preview, --retry, --compare or --history")
+                             "--retry-preview, --retry, --compare, --history or "
+                             "--run-history-retry")
         if args.compare is not None and (args.preview or args.only is not None
                                          or args.retry_preview is not None
                                          or args.retry is not None
-                                         or args.history is not None):
+                                         or args.history is not None
+                                         or args.run_history_retry is not None):
             raise ValueError("--compare cannot be combined with --only, --preview, "
-                             "--retry-preview, --retry or --history")
+                             "--retry-preview, --retry, --history or "
+                             "--run-history-retry")
         if args.retry_preview is not None and (args.preview or args.only is not None
-                                               or args.history is not None):
-            raise ValueError("--retry-preview cannot be combined with --preview, --only or --history")
+                                               or args.history is not None
+                                               or args.run_history_retry is not None):
+            raise ValueError("--retry-preview cannot be combined with --preview, "
+                             "--only, --history or --run-history-retry")
         if args.retry is not None and (args.preview or args.only is not None
                                        or args.retry_preview is not None
-                                       or args.history is not None):
+                                       or args.history is not None
+                                       or args.run_history_retry is not None):
             raise ValueError("--retry cannot be combined with --only, --preview, "
-                             "--retry-preview or --history")
+                             "--retry-preview, --history or --run-history-retry")
         plan = local_path(args.root, args.plan)
         if plan == local_path(args.root, args.output):
             raise ValueError("report cannot overwrite its plan")
@@ -1389,6 +1514,10 @@ def main():
         elif args.run_changed is not None:
             results = run_changes(args.root, jobs, args.output, args.run_changed,
                                   record_reasons=args.record_reasons)
+        elif args.run_history_retry is not None:
+            results = run_history_retry(args.root, jobs, args.output,
+                                        args.run_history_retry,
+                                        record_reasons=args.record_reasons)
         else:
             results = run_plan(args.root, jobs, args.output, targets=args.only,
                                record_reasons=args.record_reasons)
