@@ -64,6 +64,23 @@ partial result. Nothing is read besides the plan and reports, a report
 may equal --output, and nothing is created or written. Cannot combine with
 --only, --record-reasons or any other execution, preview or query option.
 
+History retry run
+python3 job_planner.py samples/plan-dependencies.json --run-history-retry r1.json --run-history-retry r2.json --output .results/deps.json
+Executes the same range the history retry preview would show for the same
+reports (oldest to newest; repeats allowed, nothing is sorted or scanned):
+each task is judged by its last recording report and only tasks whose
+latest status is failed/blocked become targets; the run covers them plus
+every prerequisite (shared once, even completed or never-recorded ones)
+and unrelated branches never run. Ordering, failures and blocked_by follow
+a normal run, judged on this run's results only. The report at --output
+holds just this run's records; a report may equal --output or alias the
+same file (the range uses the pre-overwrite content). No targets prints
+{"completed":0,"failed":0}, exits 0 and touches no files. Bad reports,
+plans or option combinations exit 2 with an error JSON; output write
+failures exit 2 without undoing finished tasks. --record-reasons is
+allowed and records mode "retry" with the preview's targets/jobs (no
+sources); every other execution, preview or query option conflicts.
+
 Compare
 python3 job_planner.py samples/plan-dependencies.json --compare .results/deps.json .results/deps.json
 Reads two reports without running anything and prints {"jobs": [...]}, one
@@ -139,7 +156,7 @@ Adds an optional record of why the run happened: the report at --output
 gains one top-level "execution" object (only when at least one task
 runs), with exactly mode, targets and jobs. mode is all for a full run,
 only for --only selections (even selecting every job), retry for
---retry and changes for --run-changed. targets are this run's targets
+--retry and --run-history-retry, and changes for --run-changed. targets are this run's targets
 in plan order: every job, the explicit targets, the old report's
 failed/blocked jobs, or the directly changed tasks plus their
 downstream dependants. jobs use the corresponding preview's fields and
@@ -159,5 +176,6 @@ old reports need no changes.
 Smoke Test
 python3 -B -m unittest -v
 Checks real file operations, recorded errors, directory boundaries, symlinks,
-dependency validation/blocking, plan, retry and history-retry previews, manual retries,
-change-driven runs, report comparison, failure explanation and the CLI.
+dependency validation/blocking, plan, retry and history-retry previews, manual
+and history-range retries, change-driven runs, report comparison, failure
+explanation and the CLI.

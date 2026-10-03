@@ -867,6 +867,41 @@ def preview_retry(root, jobs, output, report):
     return {"targets": targets, "jobs": _preview_entries(jobs, deps_by_name, targets)}
 
 
+def _history_retry_targets(root, jobs, deps_by_name, reports):
+    """Validate ``reports`` and return the retry range's ``(targets, sources)``.
+
+    Shared by ``preview_history_retry`` and ``run_history_retry`` so both
+    always select the same range: reports are read strictly in the given
+    order (repeats keep separate positions) and each task is judged by the
+    last report recording it — a later report missing the task never clears
+    an older status. Targets are the tasks whose latest record is
+    ``failed`` or ``blocked``, in current plan order; sources parallels
+    targets with each target's latest status, report path and zero-based
+    report index. Every report is fully validated, including out-of-scope
+    and overridden records.
+    """
+    if not isinstance(reports, list) or not reports:
+        raise ValueError("reports must be a nonempty list of report paths")
+    if any(not isinstance(report, str) or not report.strip() for report in reports):
+        raise ValueError("report paths must be nonblank strings")
+    latest = {}
+    for index, report in enumerate(reports):
+        records = _read_compare_report(root, report, deps_by_name,
+                                       exact_numbers=True)
+        for name, record in records.items():
+            latest[name] = {"status": record["status"],
+                            "report": report, "index": index}
+    targets = []
+    sources = []
+    for job in jobs:
+        source = latest.get(job["name"])
+        if source is not None and source["status"] in ("failed", "blocked"):
+            targets.append(job["name"])
+            sources.append({"name": job["name"], "status": source["status"],
+                            "report": source["report"], "index": source["index"]})
+    return targets, sources
+
+
 def preview_history_retry(root, jobs, output, reports):
     """Preview a retry range from several historical reports, read-only.
 
@@ -905,25 +940,7 @@ def preview_history_retry(root, jobs, output, reports):
     never read, and a report path may equal ``output``.
     """
     deps_by_name, _report_path = _validate_plan(root, jobs, output)
-    if not isinstance(reports, list) or not reports:
-        raise ValueError("reports must be a nonempty list of report paths")
-    if any(not isinstance(report, str) or not report.strip() for report in reports):
-        raise ValueError("report paths must be nonblank strings")
-    latest = {}
-    for index, report in enumerate(reports):
-        records = _read_compare_report(root, report, deps_by_name,
-                                       exact_numbers=True)
-        for name, record in records.items():
-            latest[name] = {"status": record["status"],
-                            "report": report, "index": index}
-    targets = []
-    sources = []
-    for job in jobs:
-        source = latest.get(job["name"])
-        if source is not None and source["status"] in ("failed", "blocked"):
-            targets.append(job["name"])
-            sources.append({"name": job["name"], "status": source["status"],
-                            "report": source["report"], "index": source["index"]})
+    targets, sources = _history_retry_targets(root, jobs, deps_by_name, reports)
     if not targets:
         return {"targets": [], "jobs": [], "sources": []}
     return {"targets": targets,
@@ -1179,6 +1196,63 @@ def run_retry(root, jobs, output, report, record_reasons=False):
     return _run_selected(root, selected, deps_by_name, report_path, execution)
 
 
+def run_history_retry(root, jobs, output, reports, record_reasons=False):
+    """Execute a manual retry range derived from several historical reports.
+
+    Target selection and scope mirror ``preview_history_retry``: ``reports``
+    is a nonempty list of nonblank root-relative report paths interpreted
+    oldest to newest in the order given (repeats keep separate positions
+    and nothing is sorted or scanned), each task is judged by the last
+    report recording it — a later report missing the task never clears an
+    older status — and tasks whose latest record is ``failed`` or
+    ``blocked`` become targets in current plan order. The run covers the
+    targets plus every direct and indirect prerequisite — prerequisites the
+    history marked ``completed`` or never recorded are re-executed too, and
+    shared prerequisites run once; unrelated branches are neither read nor
+    recorded.
+
+    Execution order, failure records and ``blocked_by`` propagation are
+    exactly ``run_plan``'s, driven solely by this run's results: input read
+    failures, unknown operations and invalid contents are recorded
+    ``failed``, independent branches keep running and blocked tasks never
+    read their input. The returned list holds this run's records in actual
+    processing order and is written to ``output`` under ``results``,
+    replacing any prior content — old records are never copied. A report
+    path may equal ``output`` or name the same file another way; the range
+    is chosen from all the historical content read before the overwrite.
+
+    With no targets the empty list is returned without reading task inputs,
+    creating directories or touching the report. The whole plan (including
+    unselected branches and an empty scope), every input path and the
+    output path are validated first, and then every report is fully
+    validated under ``preview_history_retry``'s path, UTF-8, structure,
+    name, status and strict payload rules — including out-of-scope and
+    overridden older records — so an illegal ``reports``, plan or report
+    raises ValueError before anything runs and no file changes. Creating
+    the output directory or writing the report may raise OSError after
+    tasks have run; executed tasks are not undone.
+
+    With ``record_reasons=True`` and at least one target, the written
+    report additionally carries the top-level ``execution`` object with
+    ``mode`` ``"retry"``; ``targets`` and ``jobs`` are exactly
+    ``preview_history_retry``'s (``sources`` is not recorded), in the same
+    names and order as ``results``, computed from the report contents read
+    before any overwrite, and the reasons query reads them back. With no
+    targets nothing is written and no ``execution`` is recorded.
+    ``record_reasons`` must be a bool; other values raise ValueError.
+    """
+    _require_bool(record_reasons)
+    deps_by_name, report_path = _validate_plan(root, jobs, output)
+    targets, _sources = _history_retry_targets(root, jobs, deps_by_name, reports)
+    if not targets:
+        return []
+    selected = _select_jobs(jobs, targets)
+    execution = ({"mode": "retry", "targets": list(targets),
+                  "jobs": _preview_entries(jobs, deps_by_name, targets)}
+                 if record_reasons else None)
+    return _run_selected(root, selected, deps_by_name, report_path, execution)
+
+
 def run_changes(root, jobs, output, changed_inputs, record_reasons=False):
     """Execute the tasks affected by changed input files.
 
@@ -1259,6 +1333,10 @@ def main():
                         metavar="REPORT",
                         help="preview a retry range from the newest matching record "
                              "across REPORT (repeatable, oldest to newest), read-only")
+    parser.add_argument("--run-history-retry", action="append", default=None,
+                        metavar="REPORT",
+                        help="rerun the retry range selected from the newest matching "
+                             "record across REPORT (repeatable, oldest to newest)")
     parser.add_argument("--execution", metavar="REPORT",
                         help="print the execution reasons recorded in REPORT, read-only")
     parser.add_argument("--changed", action="append", default=None, metavar="PATH",
@@ -1269,6 +1347,21 @@ def main():
                         help="record why this run happened in the report's execution object")
     args = parser.parse_args()
     try:
+        if args.run_history_retry is not None and (args.only is not None
+                                                   or args.preview
+                                                   or args.retry_preview is not None
+                                                   or args.retry is not None
+                                                   or args.compare is not None
+                                                   or args.explain is not None
+                                                   or args.history is not None
+                                                   or args.history_retry is not None
+                                                   or args.execution is not None
+                                                   or args.changed is not None
+                                                   or args.run_changed is not None):
+            raise ValueError("--run-history-retry cannot be combined with --only, "
+                             "--preview, --retry-preview, --retry, --compare, "
+                             "--explain, --history, --history-retry, --execution, "
+                             "--changed or --run-changed")
         if args.history_retry is not None and (args.only is not None
                                                or args.record_reasons
                                                or args.preview
@@ -1389,6 +1482,10 @@ def main():
         elif args.run_changed is not None:
             results = run_changes(args.root, jobs, args.output, args.run_changed,
                                   record_reasons=args.record_reasons)
+        elif args.run_history_retry is not None:
+            results = run_history_retry(args.root, jobs, args.output,
+                                        args.run_history_retry,
+                                        record_reasons=args.record_reasons)
         else:
             results = run_plan(args.root, jobs, args.output, targets=args.only,
                                record_reasons=args.record_reasons)
