@@ -1041,6 +1041,41 @@ def preview_changes(root, jobs, output, changed_inputs):
     return {"targets": targets, "jobs": entries}
 
 
+def _apply_output_mode(fd, temporary, previous_mode):
+    """Give the staged report the permissions a plain overwrite would have.
+
+    An existing output's mode is preserved; a fresh output gets the mode
+    a plain create would (0666 minus the process umask), since ``mkstemp``
+    forces 0600. Platforms differ in which permission interfaces they
+    provide — Windows has no ``os.fchmod``, and a minimal platform may
+    lack ``os.umask`` or usable ``os.chmod`` — so each step degrades to
+    the next: descriptor-based ``fchmod`` first, then path-based
+    ``chmod``, then the temporary file's create mode. A platform simply
+    not offering an interface (AttributeError or NotImplementedError) is
+    not a permission denial and is never reported as one; a genuine
+    filesystem error from an interface the platform does provide
+    propagates as OSError like any other save failure.
+    """
+    if previous_mode is not None:
+        mode = previous_mode
+    else:
+        try:
+            umask = os.umask(0)
+            os.umask(umask)
+        except (AttributeError, NotImplementedError):
+            # No umask interface: keep the temporary file's create mode.
+            return
+        mode = 0o666 & ~umask
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is not None:
+        fchmod(fd, mode)
+        return
+    try:
+        os.chmod(temporary, mode)
+    except (AttributeError, NotImplementedError):
+        pass
+
+
 def _save_report(report_path, report):
     """Serialize ``report`` and atomically replace the output file with it.
 
@@ -1053,12 +1088,16 @@ def _save_report(report_path, report):
     replacing the output raises OSError (including when the output path
     already is a directory) with the pre-run output file preserved
     byte-for-byte — or still absent when there was none — and no partial
-    or extra files left behind; empty parent directories created for the
-    attempt may remain. ``report_path`` is already symlink-resolved, so a
-    legal in-root symlink output updates the resolved target while the
-    link itself is kept. The saved file keeps the permissions a plain
-    overwrite would have: an existing output's mode is preserved and a
-    new file follows the process umask.
+    or extra files or unreleased descriptors left behind; empty parent
+    directories created for the attempt may remain. ``report_path`` is
+    already symlink-resolved, so a legal in-root symlink output updates
+    the resolved target while the link itself is kept. The saved file
+    keeps the permissions a plain overwrite would have: an existing
+    output's mode is preserved and a new file follows the process umask
+    where the platform exposes those interfaces; platforms without them
+    (Windows has no ``os.fchmod``) simply keep their ordinary
+    file-creation semantics, and a missing permission interface is never
+    reported as an error.
     """
     try:
         data = (json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
@@ -1073,18 +1112,17 @@ def _save_report(report_path, report):
                                      prefix=report_path.name + ".",
                                      suffix=".tmp")
     try:
-        if previous_mode is not None:
-            os.fchmod(fd, previous_mode)
-        else:
-            # mkstemp forces 0600; a fresh output gets the same mode a
-            # plain create would, 0666 minus the process umask.
-            umask = os.umask(0)
-            os.umask(umask)
-            os.fchmod(fd, 0o666 & ~umask)
+        _apply_output_mode(fd, temporary, previous_mode)
         with os.fdopen(fd, "wb") as handle:
+            fd = None  # the file object now owns the descriptor
             handle.write(data)
         os.replace(temporary, report_path)
-    except OSError:
+    except BaseException:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.unlink(temporary)
         except OSError:
