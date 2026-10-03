@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 from pathlib import Path
 import subprocess
 import sys
@@ -3105,6 +3106,251 @@ class NonJsonConstantTests(unittest.TestCase):
             with self.subTest(extra=extra):
                 run = subprocess.run(prefix + extra, capture_output=True, text=True)
                 self.assertEqual(run.returncode, 0, run.stderr)
+
+
+class DeepNestingTests(unittest.TestCase):
+    """Legal deeply nested result payloads never depend on recursion depth."""
+
+    DEPTH = 600
+    SHAPES = ("arrays", "objects", "alternating")
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "notes.txt").write_text("one\ntwo\n", encoding="utf-8")
+
+    def _jobs(self):
+        return [
+            {"name": "deep", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "down", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["deep"]},
+            {"name": "lonely", "operation": "count-lines", "input": "notes.txt"},
+        ]
+
+    def _deep_body(self, shape, leaf):
+        n = self.DEPTH
+        if shape == "arrays":
+            return "[" * n + leaf + "]" * n
+        if shape == "objects":
+            return '{"k":' * n + leaf + "}" * n
+        openers = "".join("[" if i % 2 == 0 else '{"k":' for i in range(n))
+        closers = "".join("]" if (n - 1 - i) % 2 == 0 else "}" for i in range(n))
+        return openers + leaf + closers
+
+    def _write_deep(self, relative, shape, leaf, name="deep"):
+        # result stays an object; the 600-level chain nests inside its "v".
+        body = '{"v":' + self._deep_body(shape, leaf) + "}"
+        raw = (b'{"results":[{"name":' + json.dumps(name).encode("utf-8")
+               + b',"status":"completed","result":' + body.encode("utf-8")
+               + b',"ignored":[{"fine":true}]}]}')
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+        return path
+
+    def _write(self, relative, payload):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def _chain(self, result):
+        """The 600-level chain nested inside a result object's "v" key."""
+        return result["v"]
+
+    def _descend(self, value):
+        """Return the scalar at the DEPTH-deep nesting edge of the chain."""
+        for i in range(self.DEPTH):
+            value = value[0] if isinstance(value, list) else value["k"]
+        return value
+
+    def _depth(self, value):
+        deepest = 0
+        stack = [(value, 0)]
+        while stack:
+            node, level = stack.pop()
+            if isinstance(node, list):
+                stack.extend((item, level + 1) for item in node)
+            elif isinstance(node, dict):
+                stack.extend((item, level + 1) for item in node.values())
+            else:
+                deepest = max(deepest, level)
+        return deepest
+
+    def test_compare_deep_identical_structure_is_unchanged_and_complete(self):
+        jobs = self._jobs()
+        limit_before = sys.getrecursionlimit()
+        for shape in self.SHAPES:
+            with self.subTest(shape=shape):
+                self._write_deep(f"{shape}.json", shape, json.dumps("dép-å"))
+                result = compare_reports(self.root, jobs, "never/created.json",
+                                         f"{shape}.json", f"{shape}.json")
+                self.assertEqual(len(result["jobs"]), 1)
+                row = result["jobs"][0]
+                self.assertEqual(row["name"], "deep")
+                self.assertEqual(row["change"], "unchanged")
+                for side in (row["before"], row["after"]):
+                    self.assertEqual(self._depth(self._chain(side["result"])), self.DEPTH)
+                    self.assertEqual(self._descend(self._chain(side["result"])), "dép-å")
+                # The ignored extra field never leaks into the compared side.
+                self.assertEqual(set(row["before"]), {"status", "result"})
+        self.assertEqual(sys.getrecursionlimit(), limit_before)
+        self.assertFalse((self.root / "never").exists())
+
+    def test_compare_deep_change_only_at_the_innermost_string(self):
+        jobs = self._jobs()
+        for shape in self.SHAPES:
+            with self.subTest(shape=shape):
+                self._write_deep(f"{shape}-a.json", shape, json.dumps("old"))
+                self._write_deep(f"{shape}-b.json", shape, json.dumps("new"))
+                result = compare_reports(self.root, jobs, "out.json",
+                                         f"{shape}-a.json", f"{shape}-b.json")
+                row = result["jobs"][0]
+                self.assertEqual(row["change"], "changed")
+                self.assertEqual(self._descend(self._chain(row["before"]["result"])), "old")
+                self.assertEqual(self._descend(self._chain(row["after"]["result"])), "new")
+                # Outer structure is otherwise intact on both sides.
+                self.assertEqual(self._depth(self._chain(row["before"]["result"])), self.DEPTH)
+                self.assertEqual(self._depth(self._chain(row["after"]["result"])), self.DEPTH)
+
+    def test_compare_deep_keeps_existing_value_rules_and_exact_decimals(self):
+        jobs = self._jobs()
+        # (before leaf, after leaf, expected change) at the deepest edge.
+        cases = [
+            ('{"a":1,"b":2}', '{"b":2,"a":1}', "unchanged"),       # key order
+            ("[1,2]", "[2,1]", "changed"),                          # array order
+            ("true", "1", "changed"),                               # bool vs number
+            ("false", "false", "unchanged"),
+            ('{"x":1}', '{"x":1.0}', "unchanged"),                  # exact decimal
+            ('{"x":"1"}', '{"x":1}', "changed"),                    # number vs string
+            ("0.10000000000000001", "0.1", "changed"),
+            ("1e400", "2e400", "changed"),
+            ("1e-400", "0", "changed"),
+            ("1e400", "10e399", "unchanged"),
+            ("-0", "0", "unchanged"),
+        ]
+        for index, (old_leaf, new_leaf, expected) in enumerate(cases):
+            with self.subTest(case=(old_leaf, new_leaf)):
+                self._write_deep(f"old-{index}.json", "alternating", old_leaf)
+                self._write_deep(f"new-{index}.json", "alternating", new_leaf)
+                row = compare_reports(self.root, jobs, "out.json",
+                                      f"old-{index}.json",
+                                      f"new-{index}.json")["jobs"][0]
+                self.assertEqual(row["change"], expected)
+        # Full levels and exact values survive on a present side: huge and
+        # sub-float numbers stay Decimal, never become float/string/infinity.
+        self._write_deep("nums.json", "arrays",
+                         '{"big":1e400,"tiny":1e-400,'
+                         '"long":0.10000000000000001}')
+        row = compare_reports(self.root, jobs, "out.json", "nums.json",
+                              "nums.json")["jobs"][0]
+        leaf = self._descend(self._chain(row["before"]["result"]))
+        self.assertEqual(leaf["big"], Decimal("1e400"))
+        self.assertEqual(leaf["tiny"], Decimal("1e-400"))
+        self.assertEqual(leaf["long"], Decimal("0.10000000000000001"))
+        self.assertIsInstance(leaf["big"], Decimal)
+        self.assertTrue(leaf["tiny"].is_finite() and leaf["tiny"] != 0)
+
+    def test_history_deep_preserves_levels_order_duplicates_and_missing(self):
+        jobs = self._jobs()
+        limit_before = sys.getrecursionlimit()
+        self._write_deep("r1.json", "arrays", json.dumps("one"))
+        self._write_deep("r2.json", "objects", '{"v":1e400}')
+        self._write("empty.json", {"results": []})
+        result = query_history(self.root, jobs, "out.json",
+                               ["r1.json", "r1.json", "r2.json", "empty.json"])
+        names = [row["name"] for row in result["jobs"]]
+        # "down" and "lonely" appear nowhere, so they are not listed.
+        self.assertEqual(names, ["deep"])
+        history = result["jobs"][0]["history"]
+        self.assertEqual([entry["report"] for entry in history],
+                         ["r1.json", "r1.json", "r2.json", "empty.json"])
+        self.assertEqual(self._descend(self._chain(history[0]["record"]["result"])), "one")
+        self.assertEqual(self._descend(self._chain(history[1]["record"]["result"])), "one")
+        leaf2 = self._descend(self._chain(history[2]["record"]["result"]))
+        self.assertEqual(leaf2, {"v": Decimal("1e400")})
+        self.assertIsNone(history[3]["record"])
+        self.assertEqual(sys.getrecursionlimit(), limit_before)
+
+    def test_history_only_filters_names_without_expanding_dependencies(self):
+        jobs = self._jobs()
+        self._write_deep("r1.json", "alternating", json.dumps("x"))
+        # Naming only the dependent lists exactly that task; the prerequisite
+        # is not expanded into the answer even though it has records.
+        result = query_history(self.root, jobs, "out.json", ["r1.json"],
+                               targets=["down"])
+        self.assertEqual([row["name"] for row in result["jobs"]], ["down"])
+        self.assertEqual(result["jobs"][0]["history"],
+                         [{"report": "r1.json", "record": None}])
+        # An unrecorded task still appears with an all-null history.
+        result = query_history(self.root, jobs, "out.json", ["r1.json"],
+                               targets=["lonely"])
+        self.assertEqual([row["name"] for row in result["jobs"]], ["lonely"])
+        self.assertIsNone(result["jobs"][0]["history"][0]["record"])
+
+    def test_cli_compare_deep_outputs_full_legal_json_and_exits_0(self):
+        jobs = self._jobs()
+        (self.root / "plan.json").write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        self._write_deep("same.json", "alternating",
+                         '{"s":"dép-å","big":1e400,"tiny":1e-400}')
+        run = subprocess.run(prefix + ["--compare", "same.json", "same.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertFalse(run.stderr)
+        self.assertNotIn("Infinity", run.stdout)
+        # parse_constant rejects bare NaN/Infinity even at the deepest edge.
+        payload = json.loads(run.stdout, parse_float=Decimal,
+                             parse_constant=lambda value: (_ for _ in ()).throw(
+                                 ValueError(value)))
+        row = payload["jobs"][0]
+        self.assertEqual(row["change"], "unchanged")
+        self.assertGreaterEqual(self._depth(self._chain(row["before"]["result"])),
+                                self.DEPTH)
+        leaf = self._descend(self._chain(row["before"]["result"]))
+        self.assertEqual(leaf["s"], "dép-å")
+        self.assertEqual(leaf["big"], Decimal("1e400"))
+        self.assertEqual(leaf["tiny"], Decimal("1e-400"))
+        # The UTF-8 text is emitted unescaped and nothing is truncated.
+        self.assertIn("dép-å", run.stdout)
+        self.assertGreaterEqual(run.stdout.count("[") + run.stdout.count("{"),
+                                        self.DEPTH)
+
+        self._write_deep("other.json", "alternating",
+                         '{"s":"dép-å","big":2e400,"tiny":1e-400}')
+        run = subprocess.run(prefix + ["--compare", "same.json", "other.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertFalse(run.stderr)
+        self.assertEqual(json.loads(run.stdout)["jobs"][0]["change"], "changed")
+
+    def test_cli_history_deep_with_only_exits_0_and_keeps_full_levels(self):
+        jobs = self._jobs()
+        (self.root / "plan.json").write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        self._write_deep("r.json", "arrays", '{"x":0.10000000000000001}')
+        run = subprocess.run(prefix + ["--history", "r.json", "--only", "deep"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertFalse(run.stderr)
+        payload = json.loads(run.stdout, parse_float=Decimal)
+        self.assertEqual([row["name"] for row in payload["jobs"]], ["deep"])
+        record = payload["jobs"][0]["history"][0]["record"]
+        self.assertGreaterEqual(self._depth(self._chain(record["result"])),
+                                self.DEPTH)
+        self.assertEqual(self._descend(self._chain(record["result"])),
+                         {"x": Decimal("0.10000000000000001")})
+        # --only does not pull in the declared dependency.
+        run = subprocess.run(prefix + ["--history", "r.json", "--only", "down"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout),
+                         {"jobs": [{"name": "down",
+                                    "history": [{"report": "r.json",
+                                                 "record": None}]}]})
 
 
 if __name__ == "__main__":

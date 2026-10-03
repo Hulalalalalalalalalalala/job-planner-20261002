@@ -365,39 +365,45 @@ def _json_equal(a, b):
 
     Booleans are not numbers (``true`` differs from ``1``), numbers never
     equal strings, object key order is irrelevant, array order is
-    significant, and nesting is compared recursively. Compare-side
-    reports keep every number as the ``Decimal`` of its literal text, so
-    numbers compare by their exact decimal value: ``1``, ``1.0`` and
-    ``1e0`` are equal and negative zero equals zero, while values that
-    merely share a double-precision representation (``0.1`` vs
-    ``0.10000000000000001``, ``9007199254740992`` vs
-    ``9007199254740993``) are not, and this stays correct beyond float
-    range (``1e400`` vs ``2e400``, ``1e-400`` vs ``0`` differ;
-    ``1e400`` equals ``10e399``).
+    significant, and nesting is compared iteratively on an explicit
+    stack, so a legal ``result`` hundreds of levels deep cannot exhaust
+    Python's recursion limit. Compare-side reports keep every number as
+    the ``Decimal`` of its literal text, so numbers compare by their
+    exact decimal value: ``1``, ``1.0`` and ``1e0`` are equal and
+    negative zero equals zero, while values that merely share a
+    double-precision representation (``0.1`` vs ``0.10000000000000001``,
+    ``9007199254740992`` vs ``9007199254740993``) are not, and this stays
+    correct beyond float range (``1e400`` vs ``2e400``, ``1e-400`` vs
+    ``0`` differ; ``1e400`` equals ``10e399``).
     """
-    if isinstance(a, bool) or isinstance(b, bool):
-        return isinstance(a, bool) and isinstance(b, bool) and a == b
-    if isinstance(a, (int, float, Decimal)) and isinstance(b, (int, float, Decimal)):
-        return Decimal(a) == Decimal(b)
-    if isinstance(a, dict) and isinstance(b, dict):
-        return a.keys() == b.keys() and all(_json_equal(a[k], b[k]) for k in a)
-    if isinstance(a, list) and isinstance(b, list):
-        return len(a) == len(b) and all(_json_equal(x, y) for x, y in zip(a, b))
-    return a == b
+    pending = [(a, b)]
+    while pending:
+        a, b = pending.pop()
+        # bool subclasses int, so it must be tested before any number.
+        if isinstance(a, bool) or isinstance(b, bool):
+            if not (isinstance(a, bool) and isinstance(b, bool) and a == b):
+                return False
+        elif isinstance(a, (int, float, Decimal)) and isinstance(
+                b, (int, float, Decimal)):
+            if Decimal(a) != Decimal(b):
+                return False
+        elif isinstance(a, dict) and isinstance(b, dict):
+            if a.keys() != b.keys():
+                return False
+            # dict_keys equality ignores order; child pairs may be queued
+            # in any order since every pair is an independent comparison.
+            pending.extend((a[k], b[k]) for k in a)
+        elif isinstance(a, list) and isinstance(b, list):
+            if len(a) != len(b):
+                return False
+            pending.extend(zip(a, b))
+        elif a != b:
+            return False
+    return True
 
 
-def _encode_compare_json(value, level=0):
-    """Serialize compare/history output, writing ``Decimal`` numbers literally.
-
-    Compare- and history-side reports parse every JSON number into the
-    ``Decimal`` of its literal text, so a plain ``json.dumps`` would turn
-    the value into a string or round it through float. This emits each
-    ``Decimal`` via ``str`` as a raw, finite JSON number — fixed point or
-    ``E`` exponent as ``Decimal`` chooses, still an exact legal number —
-    rather than a string, a rounded float or an infinity; trailing zeros
-    and exponent spelling are not guaranteed. Nested containers are
-    indented exactly like ``json.dumps(..., indent=2)``.
-    """
+def _encode_compare_scalar(value):
+    """Render a single non-container compare/history JSON value."""
     if value is None:
         return "null"
     if value is True:
@@ -412,23 +418,65 @@ def _encode_compare_json(value, level=0):
         return str(value)
     if isinstance(value, float):
         return repr(value)
-    if isinstance(value, (list, tuple)):
-        if not value:
-            return "[]"
-        inner = "\n" + "  " * (level + 1)
-        pieces = [inner + _encode_compare_json(item, level + 1) for item in value]
-        closer = "\n" + "  " * level
-        return "[" + ",".join(pieces) + closer + "]"
-    if isinstance(value, dict):
-        if not value:
-            return "{}"
-        inner = "\n" + "  " * (level + 1)
-        pieces = [inner + json.dumps(str(key), ensure_ascii=False) + ": "
-                  + _encode_compare_json(item, level + 1)
-                  for key, item in value.items()]
-        closer = "\n" + "  " * level
-        return "{" + ",".join(pieces) + closer + "}"
     raise TypeError(f"cannot serialize {type(value).__name__} in compare output")
+
+
+def _encode_compare_json(value):
+    """Serialize compare/history output, writing ``Decimal`` numbers literally.
+
+    Compare- and history-side reports parse every JSON number into the
+    ``Decimal`` of its literal text, so a plain ``json.dumps`` would turn
+    the value into a string or round it through float. This emits each
+    ``Decimal`` via ``str`` as a raw, finite JSON number — fixed point or
+    ``E`` exponent as ``Decimal`` chooses, still an exact legal number —
+    rather than a string, a rounded float or an infinity; trailing zeros
+    and exponent spelling are not guaranteed. Nested containers are
+    indented exactly like ``json.dumps(..., indent=2)``.
+
+    The walk uses an explicit stack rather than recursion, so a legal
+    ``result`` hundreds of objects or arrays deep serializes in full
+    without touching Python's recursion limit.
+    """
+    parts = []
+    # Entries are ("node", value, level) to render or ("lit", text, None)
+    # emitted verbatim; pushing children in reverse renders them in order.
+    stack = [("node", value, 0)]
+    while stack:
+        kind, item, level = stack.pop()
+        if kind == "lit":
+            parts.append(item)
+            continue
+        if not isinstance(item, (dict, list, tuple)):
+            parts.append(_encode_compare_scalar(item))
+            continue
+        if isinstance(item, dict):
+            if not item:
+                parts.append("{}")
+                continue
+            parts.append("{")
+            stack.append(("lit", "\n" + "  " * level + "}", None))
+            entries = list(item.items())
+            for index, (key, child) in reversed(list(enumerate(entries))):
+                if index < len(entries) - 1:
+                    stack.append(("lit", ",", None))
+                stack.append(("node", child, level + 1))
+                stack.append(("lit",
+                              "\n" + "  " * (level + 1)
+                              + json.dumps(str(key), ensure_ascii=False) + ": ",
+                              None))
+        else:
+            if not item:
+                parts.append("[]")
+                continue
+            parts.append("[")
+            stack.append(("lit", "\n" + "  " * level + "]", None))
+            entries = list(item)
+            for index, child in reversed(list(enumerate(entries))):
+                if index < len(entries) - 1:
+                    stack.append(("lit", ",", None))
+                stack.append(("node", child, level + 1))
+                stack.append(("lit", "\n" + "  " * (level + 1), None))
+    return "".join(parts)
 
 
 def _compare_dumps(value):
