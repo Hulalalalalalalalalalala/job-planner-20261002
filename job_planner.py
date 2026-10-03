@@ -1041,6 +1041,33 @@ def preview_changes(root, jobs, output, changed_inputs):
     return {"targets": targets, "jobs": entries}
 
 
+def _apply_output_mode(fd, previous_mode):
+    """Give the staged temporary file the permission bits the output should have.
+
+    An existing output's mode is preserved; a fresh output gets the mode a
+    plain create would have — 0666 minus the process umask — instead of
+    the 0600 ``mkstemp`` forces. Permission bits are a Unix concept:
+    platforms without a file-descriptor chmod interface, or where it is
+    not implemented, skip this step and follow their normal file
+    semantics — a missing or unimplemented interface is not a permission
+    denial. A real denial from the interface itself is a filesystem error
+    and propagates as OSError.
+    """
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is None:
+        return
+    if previous_mode is not None:
+        mode = previous_mode
+    else:
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
+    try:
+        fchmod(fd, mode)
+    except NotImplementedError:
+        pass
+
+
 def _save_report(report_path, report):
     """Serialize ``report`` and atomically replace the output file with it.
 
@@ -1049,16 +1076,19 @@ def _save_report(report_path, report):
     document raises ValueError and nothing is created, changed or removed.
     The encoded bytes are then written to a temporary file in the same
     directory and moved over the target with ``os.replace``, so a
-    filesystem error while creating the directory, saving the content or
-    replacing the output raises OSError (including when the output path
-    already is a directory) with the pre-run output file preserved
-    byte-for-byte — or still absent when there was none — and no partial
-    or extra files left behind; empty parent directories created for the
-    attempt may remain. ``report_path`` is already symlink-resolved, so a
-    legal in-root symlink output updates the resolved target while the
-    link itself is kept. The saved file keeps the permissions a plain
-    overwrite would have: an existing output's mode is preserved and a
-    new file follows the process umask.
+    filesystem error while creating the directory, creating the temporary
+    file, setting its permissions, writing the content or replacing the
+    output raises OSError (including when the output path already is a
+    directory) with the pre-run output file preserved byte-for-byte — or
+    still absent when there was none — and no temporary file or open
+    handle left behind; empty parent directories created for the attempt
+    may remain. ``report_path`` is already symlink-resolved, so a legal
+    in-root symlink output updates the resolved target while the link
+    itself is kept. The saved file keeps the permissions a plain
+    overwrite would have: on Unix an existing output's mode is preserved
+    and a new file follows the process umask, while platforms without a
+    file-descriptor permission interface (such as Windows) follow their
+    normal file semantics — see ``_apply_output_mode``.
     """
     try:
         data = (json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
@@ -1073,18 +1103,19 @@ def _save_report(report_path, report):
                                      prefix=report_path.name + ".",
                                      suffix=".tmp")
     try:
-        if previous_mode is not None:
-            os.fchmod(fd, previous_mode)
-        else:
-            # mkstemp forces 0600; a fresh output gets the same mode a
-            # plain create would, 0666 minus the process umask.
-            umask = os.umask(0)
-            os.umask(umask)
-            os.fchmod(fd, 0o666 & ~umask)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
+        try:
+            _apply_output_mode(fd, previous_mode)
+            with os.fdopen(fd, "wb") as handle:
+                fd = None  # the file object now owns the descriptor
+                handle.write(data)
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         os.replace(temporary, report_path)
-    except OSError:
+    except BaseException:
         try:
             os.unlink(temporary)
         except OSError:

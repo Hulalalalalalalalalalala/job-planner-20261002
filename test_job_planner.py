@@ -4210,6 +4210,81 @@ class AtomicSaveTests(unittest.TestCase):
         report = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual([row["name"] for row in report["results"]], ["notes"])
 
+    @unittest.skipUnless(hasattr(os, "fchmod"), "platform already lacks fchmod")
+    def test_save_without_fchmod_interface_succeeds_in_all_modes(self):
+        # A platform without a file-descriptor chmod (e.g. Windows) still
+        # saves normally in every execution mode, with reasons on or off.
+        (self.root / "r.json").write_text(json.dumps({"results": [
+            {"name": "notes", "status": "failed", "error": "x"}]}),
+            encoding="utf-8")
+        saved = os.fchmod
+        del os.fchmod
+        try:
+            for record_reasons in (False, True):
+                tag = "on" if record_reasons else "off"
+                outcomes = {
+                    "p": run_plan(self.root, self.jobs, f"p-{tag}.json",
+                                  record_reasons=record_reasons),
+                    "r": run_retry(self.root, self.jobs, f"r-{tag}.json", "r.json",
+                                   record_reasons=record_reasons),
+                    "h": run_history_retry(self.root, self.jobs, f"h-{tag}.json",
+                                           ["r.json"], record_reasons=record_reasons),
+                    "c": run_changes(self.root, self.jobs, f"c-{tag}.json",
+                                     ["notes.txt"], record_reasons=record_reasons),
+                }
+                for mode, results in outcomes.items():
+                    with self.subTest(record_reasons=record_reasons, mode=mode):
+                        self.assertEqual([row["status"] for row in results],
+                                         ["completed"])
+        finally:
+            os.fchmod = saved
+        modes = {"p": "all", "r": "retry", "h": "retry", "c": "changes"}
+        for record_reasons, tag in ((False, "off"), (True, "on")):
+            for letter, mode in modes.items():
+                with self.subTest(record_reasons=record_reasons, mode=mode):
+                    report = json.loads((self.root / f"{letter}-{tag}.json")
+                                        .read_text(encoding="utf-8"))
+                    self.assertEqual([row["name"] for row in report["results"]],
+                                     ["notes"])
+                    if record_reasons:
+                        self.assertEqual(report["execution"]["mode"], mode)
+                    else:
+                        self.assertNotIn("execution", report)
+
+    def test_unimplemented_fchmod_is_not_a_permission_denial(self):
+        # An fchmod that exists but is not implemented behaves like a
+        # missing one: the save still succeeds.
+        with mock.patch("job_planner.os.fchmod", create=True,
+                        side_effect=NotImplementedError("unsupported")):
+            results = run_plan(self.root, self.jobs, "out.json")
+        self.assertEqual([row["status"] for row in results], ["completed"])
+        report = json.loads((self.root / "out.json").read_text(encoding="utf-8"))
+        self.assertEqual(report, {"results": results})
+        self.assertEqual(self._tree(), ["notes.txt", "out.json", "plan.json"])
+
+    def test_fchmod_denial_raises_oserror_and_preserves_output(self):
+        # A real permission denial is a filesystem error, not a missing
+        # interface: it propagates and nothing is left behind.
+        marker = b"KEEP\x00\xff"
+        (self.root / "out.json").write_bytes(marker)
+        denial = mock.patch("job_planner.os.fchmod", create=True,
+                            side_effect=PermissionError("denied"))
+        with denial:
+            with self.assertRaises(OSError):
+                run_plan(self.root, self.jobs, "out.json")
+            with self.assertRaises(OSError):
+                run_plan(self.root, self.jobs, "deep/out.json")
+        self.assertEqual((self.root / "out.json").read_bytes(), marker)
+        self.assertFalse((self.root / "deep/out.json").exists())
+        # Only the new empty parent directory may remain; no temporary file.
+        self.assertEqual(self._tree(),
+                         ["deep", "notes.txt", "out.json", "plan.json"])
+        # Once the fault is gone the same outputs save again immediately.
+        results = run_plan(self.root, self.jobs, "out.json")
+        self.assertEqual([row["status"] for row in results], ["completed"])
+        results = run_plan(self.root, self.jobs, "deep/out.json")
+        self.assertEqual([row["status"] for row in results], ["completed"])
+
     def test_retry_failed_save_keeps_history_queryable(self):
         jobs = [{"name": "broken", "operation": "shell", "input": "notes.txt"}]
         run_plan(self.root, jobs, "r.json")
