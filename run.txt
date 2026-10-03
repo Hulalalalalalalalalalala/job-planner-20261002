@@ -45,6 +45,25 @@ equal --output (targets use the pre-overwrite content). No targets prints
 plans exit 2 with an error JSON; output write failures exit 2 without undoing
 finished tasks. Cannot combine with --only, --preview or --retry-preview.
 
+History retry preview
+python3 job_planner.py samples/plan-dependencies.json --history-retry r1.json --history-retry r2.json --output .results/deps.json
+Reads the named reports in the order given (oldest to newest; repeats keep
+separate positions, nothing is sorted or scanned) and prints
+{"targets": [...], "jobs": [...], "sources": [...]}. Each task is judged by
+the last report containing it — a later missing record never clears an old
+status — and only tasks whose latest status is failed/blocked become
+targets, in current plan order. jobs cover the targets plus every
+prerequisite (shared once, even completed or never-recorded ones), with
+the same fields as --preview; sources parallels targets one to one, each
+with name, status, report (verbatim) and index (zero-based report
+position). No targets prints three empty arrays. Every report is validated
+strictly like --history (including unselected and overridden records;
+NaN/Infinity/-Infinity rejected anywhere, legal numbers accepted); bad
+reports, escaping paths or a bad plan exit 2 with an error JSON and no
+partial result. Nothing is read besides the plan and reports, a report
+may equal --output, and nothing is created or written. Cannot combine with
+--only, --record-reasons or any other execution, preview or query option.
+
 Compare
 python3 job_planner.py samples/plan-dependencies.json --compare .results/deps.json .results/deps.json
 Reads two reports without running anything and prints {"jobs": [...]}, one
@@ -140,5 +159,5 @@ old reports need no changes.
 Smoke Test
 python3 -B -m unittest -v
 Checks real file operations, recorded errors, directory boundaries, symlinks,
-dependency validation/blocking, plan and retry previews, manual retries,
+dependency validation/blocking, plan, retry and history-retry previews, manual retries,
 change-driven runs, report comparison, failure explanation and the CLI.

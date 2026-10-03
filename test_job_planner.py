@@ -6,8 +6,9 @@ import sys
 import tempfile
 import unittest
 from job_planner import (compare_reports, execute_job, explain_report, local_path,
-                         preview_changes, preview_plan, preview_retry, query_execution,
-                         query_history, run_changes, run_plan, run_retry)
+                         preview_changes, preview_history_retry, preview_plan,
+                         preview_retry, query_execution, query_history, run_changes,
+                         run_plan, run_retry)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -2157,6 +2158,377 @@ class JobPlannerTests(unittest.TestCase):
             self.assertNotIn("RecursionError", run.stderr)
             self.assertNotIn("Traceback", run.stderr)
         self.assertFalse((self.root / "should").exists())
+
+
+class HistoryRetryPreviewTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "notes.txt").write_text("one\ntwo\n", encoding="utf-8")
+
+    def _write_report(self, relative, payload):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def _jobs(self):
+        return [
+            {"name": "broken", "operation": "shell", "input": "notes.txt"},
+            {"name": "downstream", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["broken"]},
+            {"name": "healthy", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "lonely", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "needs-healthy", "operation": "sha256", "input": "notes.txt",
+             "depends_on": ["healthy"]},
+        ]
+
+    def test_latest_record_per_task_selects_targets_and_sources(self):
+        jobs = self._jobs()
+        # Oldest: broken fails (downstream blocked), healthy completes.
+        self._write_report("r1.json", {"results": [
+            {"name": "broken", "status": "failed", "error": "boom"},
+            {"name": "downstream", "status": "blocked", "blocked_by": ["broken"]},
+            {"name": "healthy", "status": "completed", "result": {"lines": 2}},
+        ]})
+        # Middle: broken recovered, healthy broke; downstream unrecorded here.
+        self._write_report("r2.json", {"results": [
+            {"name": "broken", "status": "completed", "result": {"lines": 2}},
+            {"name": "healthy", "status": "failed", "error": "nope"},
+        ]})
+        # Newest: healthy recovered; nothing else recorded, so broken's
+        # completion and downstream's old blocked state both stand.
+        self._write_report("r3.json", {"results": [
+            {"name": "healthy", "status": "completed", "result": {"lines": 2}},
+        ]})
+        result = preview_history_retry(self.root, jobs, "out.json",
+                                       ["r1.json", "r2.json", "r3.json"])
+        self.assertEqual(set(result), {"targets", "jobs", "sources"})
+        # Only downstream survives: latest status failed/blocked per task,
+        # missing later records never clear it; plan order is used.
+        self.assertEqual(result["targets"], ["downstream"])
+        self.assertEqual(result["sources"], [
+            {"name": "downstream", "status": "blocked",
+             "report": "r1.json", "index": 0}])
+        # The closure matches preview_plan with those targets exactly.
+        expected = preview_plan(self.root, jobs, "out.json",
+                                targets=result["targets"])
+        self.assertEqual(result["jobs"], expected["jobs"])
+
+    def test_later_failure_overrides_completion_and_plan_order_rules(self):
+        jobs = self._jobs()
+        # Records appear shuffled; output ordering must follow the plan.
+        self._write_report("old.json", {"results": [
+            {"name": "healthy", "status": "completed", "result": {"lines": 2}},
+            {"name": "lonely", "status": "completed", "result": {"lines": 2}},
+        ]})
+        self._write_report("new.json", {"results": [
+            {"name": "lonely", "status": "failed", "error": "x"},
+            {"name": "healthy", "status": "failed", "error": "y"},
+        ]})
+        result = preview_history_retry(self.root, jobs, "out.json",
+                                       ["old.json", "new.json"])
+        self.assertEqual(result["targets"], ["healthy", "lonely"])
+        self.assertEqual(result["sources"], [
+            {"name": "healthy", "status": "failed",
+             "report": "new.json", "index": 1},
+            {"name": "lonely", "status": "failed",
+             "report": "new.json", "index": 1}])
+        names = [row["name"] for row in result["jobs"]]
+        # Closure includes needs-healthy? No: it is downstream, not a
+        # prerequisite; unrelated branches stay out.
+        self.assertNotIn("needs-healthy", names)
+        self.assertNotIn("broken", names)
+        self.assertNotIn("downstream", names)
+        self.assertEqual(names, ["healthy", "lonely"])
+        reasons = {row["name"]: row["reason"] for row in result["jobs"]}
+        self.assertEqual(reasons, {"healthy": "target", "lonely": "target"})
+
+    def test_completed_and_unrecorded_prerequisites_still_included(self):
+        jobs = self._jobs()
+        self._write_report("r1.json", {"results": [
+            {"name": "broken", "status": "completed", "result": {"lines": 2}},
+            {"name": "downstream", "status": "failed", "error": "e"},
+            {"name": "healthy", "status": "completed", "result": {"lines": 2}},
+        ]})
+        result = preview_history_retry(self.root, jobs, "out.json", ["r1.json"])
+        self.assertEqual(result["targets"], ["downstream"])
+        names = [row["name"] for row in result["jobs"]]
+        # broken completed in history but is a prerequisite, so it is included;
+        # needs-healthy is a downstream task and must not appear.
+        self.assertEqual(names, ["broken", "downstream"])
+        entry = next(row for row in result["jobs"] if row["name"] == "broken")
+        self.assertEqual(entry["reason"], "prerequisite")
+        self.assertEqual(entry["required_by"], ["downstream"])
+        target_entry = next(row for row in result["jobs"]
+                            if row["name"] == "downstream")
+        self.assertEqual(target_entry["reason"], "target")
+        self.assertEqual(target_entry["required_by"], ["downstream"])
+
+    def test_shared_prerequisite_appears_once(self):
+        jobs = [
+            {"name": "p", "operation": "shell", "input": "notes.txt"},
+            {"name": "a", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["p"]},
+            {"name": "b", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["p"]},
+        ]
+        self._write_report("r.json", {"results": [
+            {"name": "a", "status": "failed", "error": "x"},
+            {"name": "b", "status": "blocked", "blocked_by": ["p"]},
+        ]})
+        result = preview_history_retry(self.root, jobs, "out.json", ["r.json"])
+        self.assertEqual(result["targets"], ["a", "b"])
+        self.assertEqual([row["name"] for row in result["jobs"]], ["p", "a", "b"])
+        p_entry = next(row for row in result["jobs"] if row["name"] == "p")
+        self.assertEqual(p_entry["required_by"], ["a", "b"])
+        self.assertEqual([s["name"] for s in result["sources"]], ["a", "b"])
+
+    def test_no_targets_gives_three_empty_arrays(self):
+        jobs = self._jobs()
+        self._write_report("empty.json", {"results": []})
+        self.assertEqual(preview_history_retry(self.root, jobs, "out.json",
+                                               ["empty.json"]),
+                         {"targets": [], "jobs": [], "sources": []})
+        # All completed, or only never-targeted tasks recorded.
+        self._write_report("done.json", {"results": [
+            {"name": "healthy", "status": "completed", "result": {"lines": 2}},
+            {"name": "lonely", "status": "completed", "result": {"lines": 2}},
+        ]})
+        self.assertEqual(preview_history_retry(self.root, jobs, "out.json",
+                                               ["done.json"]),
+                         {"targets": [], "jobs": [], "sources": []})
+
+    def test_duplicate_report_path_keeps_separate_later_position(self):
+        jobs = self._jobs()
+        run_plan(self.root, jobs, "same.json")
+        # same content twice: the second position overrides the first, and
+        # sources point at index 1 with the path verbatim.
+        result = preview_history_retry(self.root, jobs, "out.json",
+                                       ["same.json", "same.json"])
+        targets = result["targets"]
+        self.assertEqual(targets, ["broken", "downstream"])
+        self.assertTrue(all(s["report"] == "same.json" and s["index"] == 1
+                            for s in result["sources"]))
+        self.assertEqual([s["name"] for s in result["sources"]], targets)
+
+    def test_report_path_verbatim_in_sources(self):
+        jobs = self._jobs()
+        run_plan(self.root, jobs, "results/r.json")
+        result = preview_history_retry(self.root, jobs, "out.json",
+                                       ["results/r.json"])
+        self.assertEqual(result["sources"][0]["report"], "results/r.json")
+
+    def test_invalid_reports_argument_raises(self):
+        jobs = self._jobs()
+        self._write_report("empty.json", {"results": []})
+        for bad in ([], "r1.json", None, [1], [""], ["  "]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    preview_history_retry(self.root, jobs, "out.json", bad)
+
+    def test_all_reports_validated_including_unselected_and_overridden(self):
+        jobs = self._jobs()
+        self._write_report("ok.json", {"results": []})
+        strict_cases = {
+            "bad-encoding": b'{"results": []}\xff',
+            "bad-json": b"{not json",
+            "not-object": b"[1, 2]",
+            "no-results": b"{}",
+            "results-not-list": b'{"results": {}}',
+            "entry-not-object": b'{"results": [1]}',
+            "unknown-name": b'{"results": [{"name": "ghost", "status": "completed", "result": {}}]}',
+            "duplicate-name": b'{"results": [{"name": "healthy", "status": "completed", "result": {}},'
+                              b' {"name": "healthy", "status": "failed", "error": "x"}]}',
+            "bad-status": b'{"results": [{"name": "healthy", "status": "done"}]}',
+            "completed-no-result": b'{"results":[{"name":"healthy","status":"completed"}]}',
+            "failed-no-error": b'{"results":[{"name":"broken","status":"failed"}]}',
+            "blocked-empty": b'{"results":[{"name":"downstream","status":"blocked","blocked_by":[]}]}',
+            "blocked-not-direct": b'{"results":[{"name":"downstream","status":"blocked","blocked_by":["healthy"]}]}',
+            "nan-extra": b'{"results": [], "extra": NaN}',
+            "inf-nested": b'{"results":[{"name":"healthy","status":"completed",'
+                          b'"result":{"n":Infinity}}]}',
+            "neg-inf-ignored-field": b'{"results":[{"name":"healthy","status":"completed",'
+                                     b'"result":{},"weird":-Infinity}]}',
+        }
+        # A malformed report at any position rejects everything.
+        for label, raw in strict_cases.items():
+            with self.subTest(label=label):
+                self._write_report(f"{label}.json", {"results": []})
+                (self.root / f"{label}.json").write_bytes(raw)
+                with self.assertRaises(ValueError):
+                    preview_history_retry(self.root, jobs, "out.json",
+                                          [f"{label}.json", "ok.json"])
+                with self.assertRaises(ValueError):
+                    preview_history_retry(self.root, jobs, "out.json",
+                                          ["ok.json", f"{label}.json"])
+        # An overridden old bad record is still validated, even though a newer
+        # report would make the task a non-target.
+        self._write_report("old-bad.json", {"results": [
+            {"name": "healthy", "status": "completed"}]})
+        self._write_report("new-good.json", {"results": [
+            {"name": "healthy", "status": "completed", "result": {"lines": 2}}]})
+        with self.assertRaises(ValueError):
+            preview_history_retry(self.root, jobs, "out.json",
+                                  ["old-bad.json", "new-good.json"])
+        # Records outside the eventual target scope are checked too.
+        self._write_report("out-of-scope.json", {"results": [
+            {"name": "lonely", "status": "failed"}]})
+        with self.assertRaises(ValueError):
+            preview_history_retry(self.root, jobs, "out.json",
+                                  ["out-of-scope.json"])
+        # Path, existence and symlink-boundary rules match query_history.
+        for bad in ("missing.json", "../outside.json", str(ROOT / "README.md")):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    preview_history_retry(self.root, jobs, "out.json", [bad])
+        (self.root / "out-link.json").symlink_to(ROOT / "README.md")
+        with self.assertRaises(ValueError):
+            preview_history_retry(self.root, jobs, "out.json", ["out-link.json"])
+
+    def test_legal_numbers_accepted_including_beyond_float_range(self):
+        jobs = self._jobs()
+        (self.root / "big.json").write_bytes(
+            b'{"results":[{"name":"healthy","status":"completed",'
+            b'"result":{"n":1e400}},{"name":"lonely","status":"failed",'
+            b'"error":"NaN Infinity -Infinity as strings are fine"}]}')
+        result = preview_history_retry(self.root, jobs, "out.json", ["big.json"])
+        self.assertEqual(result["targets"], ["lonely"])
+        self.assertEqual(result["sources"], [
+            {"name": "lonely", "status": "failed",
+             "report": "big.json", "index": 0}])
+
+    def test_whole_plan_and_output_validated_first_without_touching_files(self):
+        self._write_report("r.json", {"results": []})
+        bad_input = [
+            {"name": "healthy", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "stray", "operation": "count-lines", "input": "../outside.txt"},
+        ]
+        with self.assertRaises(ValueError):
+            preview_history_retry(self.root, bad_input, "out.json", ["r.json"])
+        bad_dep = [
+            {"name": "a", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["b"]},
+            {"name": "b", "operation": "count-lines", "input": "notes.txt",
+             "depends_on": ["a"]},
+        ]
+        with self.assertRaises(ValueError):
+            preview_history_retry(self.root, bad_dep, "out.json", ["r.json"])
+        good = [{"name": "notes", "operation": "count-lines", "input": "notes.txt"}]
+        with self.assertRaises(ValueError):
+            preview_history_retry(self.root, good, "notes.txt", ["r.json"])
+        # Plan failure precedes report opening: a missing report is not the
+        # error that surfaces first; either way it is a ValueError with no
+        # partial result.
+        with self.assertRaises(ValueError):
+            preview_history_retry(self.root, bad_dep, "out.json", ["missing.json"])
+        before = {p.name for p in self.root.iterdir()}
+        jobs = [{"name": "missing", "operation": "count-lines", "input": "nope.txt"}]
+        self.assertEqual(preview_history_retry(self.root, jobs,
+                                               "deep/new/out.json", ["r.json"]),
+                         {"targets": [], "jobs": [], "sources": []})
+        self.assertFalse((self.root / "deep").exists())
+        self.assertEqual({p.name for p in self.root.iterdir()}, before)
+
+    def test_report_may_equal_output_and_is_not_modified(self):
+        jobs = self._jobs()
+        run_plan(self.root, jobs, "same.json")
+        before = (self.root / "same.json").read_text()
+        result = preview_history_retry(self.root, jobs, "same.json",
+                                       ["same.json", "same.json"])
+        self.assertEqual(result["targets"], ["broken", "downstream"])
+        self.assertEqual((self.root / "same.json").read_text(), before)
+
+    def test_cli_history_retry_flag(self):
+        jobs = self._jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        run_plan(self.root, jobs, "r1.json")
+        self._write_report("r2.json", {"results": [
+            {"name": "broken", "status": "completed", "result": {"lines": 2}},
+            {"name": "downstream", "status": "completed",
+             "result": {"lines": 2}},
+        ]})
+        # Failed/blocked records still give exit 0.
+        run = subprocess.run(prefix + ["--history-retry", "r1.json",
+                                       "--history-retry", "r2.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        payload = json.loads(run.stdout)
+        self.assertEqual(set(payload), {"targets", "jobs", "sources"})
+        # r2 recovered the r1 failure branch, so nothing is targeted.
+        self.assertEqual(payload, {"targets": [], "jobs": [], "sources": []})
+        # An old failure with no later record is still selected.
+        run = subprocess.run(prefix + ["--history-retry", "r1.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        payload = json.loads(run.stdout)
+        self.assertEqual(payload["targets"], ["broken", "downstream"])
+        self.assertEqual(payload["sources"], [
+            {"name": "broken", "status": "failed",
+             "report": "r1.json", "index": 0},
+            {"name": "downstream", "status": "blocked",
+             "report": "r1.json", "index": 0}])
+        self.assertEqual([row["name"] for row in payload["jobs"]],
+                         ["broken", "downstream"])
+        # Empty results never create the default output.
+        self._write_report("empty.json", {"results": []})
+        run = subprocess.run(prefix + ["--history-retry", "empty.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout),
+                         {"targets": [], "jobs": [], "sources": []})
+        self.assertFalse((self.root / ".results").exists())
+
+    def test_cli_history_retry_conflicts_and_errors(self):
+        jobs = self._jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        self._write_report("r.json", {"results": []})
+        marker = self.root / "keep.json"
+        marker.write_text("KEEP", encoding="utf-8")
+        for extra in (["--history-retry", "r.json", "--only", "healthy"],
+                      ["--history-retry", "r.json", "--record-reasons"],
+                      ["--history-retry", "r.json", "--preview"],
+                      ["--history-retry", "r.json", "--retry-preview", "r.json"],
+                      ["--history-retry", "r.json", "--retry", "r.json"],
+                      ["--history-retry", "r.json",
+                       "--compare", "r.json", "r.json"],
+                      ["--history-retry", "r.json", "--explain", "r.json"],
+                      ["--history-retry", "r.json", "--history", "r.json"],
+                      ["--history-retry", "r.json", "--execution", "r.json"],
+                      ["--history-retry", "r.json", "--changed", "notes.txt"],
+                      ["--history-retry", "r.json", "--run-changed", "notes.txt"],
+                      ["--history-retry", "missing.json"],
+                      ["--history-retry", "../outside.json"],
+                      ["--history-retry", "r.json", "--output", "notes.txt"],
+                      ["--history-retry", "r.json", "--output", "plan.json"]):
+            run = subprocess.run(prefix + extra, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, (extra, run.stderr))
+            self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self.assertEqual(marker.read_text(), "KEEP")
+        # A bad plan is rejected before any report is opened.
+        bad = [{"name": "a", "operation": "count-lines", "input": "notes.txt",
+                "depends_on": ["x"]}]
+        plan.write_text(json.dumps({"jobs": bad}))
+        run = subprocess.run(prefix + ["--history-retry", "missing.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertEqual(set(json.loads(run.stdout)), {"error"})
+        self.assertEqual(marker.read_text(), "KEEP")
+        # A NaN-bearing report rejects at the CLI with error-only JSON.
+        plan.write_text(json.dumps({"jobs": jobs}))
+        (self.root / "nan.json").write_bytes(
+            b'{"results": [], "x": NaN}')
+        run = subprocess.run(prefix + ["--history-retry", "nan.json"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertEqual(set(json.loads(run.stdout)), {"error"})
 
 
 class RecordReasonsTests(unittest.TestCase):
