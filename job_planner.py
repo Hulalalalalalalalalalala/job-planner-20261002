@@ -365,25 +365,43 @@ def _json_equal(a, b):
 
     Booleans are not numbers (``true`` differs from ``1``), numbers never
     equal strings, object key order is irrelevant, array order is
-    significant, and nesting is compared recursively. Compare-side
-    reports keep every number as the ``Decimal`` of its literal text, so
-    numbers compare by their exact decimal value: ``1``, ``1.0`` and
-    ``1e0`` are equal and negative zero equals zero, while values that
-    merely share a double-precision representation (``0.1`` vs
-    ``0.10000000000000001``, ``9007199254740992`` vs
+    significant, and nesting is compared to arbitrary depth. The walk uses
+    an explicit stack rather than Python's call stack, so a legal report
+    whose result nests hundreds of objects or arrays cannot trigger a
+    RecursionError, and the caller's recursion limit is never changed.
+    Compare-side reports keep every number as the ``Decimal`` of its
+    literal text, so numbers compare by their exact decimal value: ``1``,
+    ``1.0`` and ``1e0`` are equal and negative zero equals zero, while
+    values that merely share a double-precision representation
+    (``0.1`` vs ``0.10000000000000001``, ``9007199254740992`` vs
     ``9007199254740993``) are not, and this stays correct beyond float
     range (``1e400`` vs ``2e400``, ``1e-400`` vs ``0`` differ;
     ``1e400`` equals ``10e399``).
     """
-    if isinstance(a, bool) or isinstance(b, bool):
-        return isinstance(a, bool) and isinstance(b, bool) and a == b
-    if isinstance(a, (int, float, Decimal)) and isinstance(b, (int, float, Decimal)):
-        return Decimal(a) == Decimal(b)
-    if isinstance(a, dict) and isinstance(b, dict):
-        return a.keys() == b.keys() and all(_json_equal(a[k], b[k]) for k in a)
-    if isinstance(a, list) and isinstance(b, list):
-        return len(a) == len(b) and all(_json_equal(x, y) for x, y in zip(a, b))
-    return a == b
+    pending = [(a, b)]
+    while pending:
+        x, y = pending.pop()
+        if isinstance(x, bool) or isinstance(y, bool):
+            if not (isinstance(x, bool) and isinstance(y, bool) and x == y):
+                return False
+            continue
+        if isinstance(x, (int, float, Decimal)) and isinstance(y, (int, float, Decimal)):
+            if Decimal(x) != Decimal(y):
+                return False
+            continue
+        if isinstance(x, dict) and isinstance(y, dict):
+            if x.keys() != y.keys():
+                return False
+            pending.extend((x[k], y[k]) for k in x)
+            continue
+        if isinstance(x, list) and isinstance(y, list):
+            if len(x) != len(y):
+                return False
+            pending.extend(zip(x, y))
+            continue
+        if x != y:
+            return False
+    return True
 
 
 def _encode_compare_json(value, level=0):
@@ -397,38 +415,65 @@ def _encode_compare_json(value, level=0):
     rather than a string, a rounded float or an infinity; trailing zeros
     and exponent spelling are not guaranteed. Nested containers are
     indented exactly like ``json.dumps(..., indent=2)``.
+
+    Containers are walked with an explicit frame stack rather than Python
+    recursion, so serializing a result hundreds of levels deep (through the
+    already-deeper CLI call stack) cannot raise RecursionError and the
+    caller's recursion limit is never touched.
     """
-    if value is None:
-        return "null"
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False)
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        return repr(value)
-    if isinstance(value, (list, tuple)):
-        if not value:
-            return "[]"
-        inner = "\n" + "  " * (level + 1)
-        pieces = [inner + _encode_compare_json(item, level + 1) for item in value]
-        closer = "\n" + "  " * level
-        return "[" + ",".join(pieces) + closer + "]"
-    if isinstance(value, dict):
-        if not value:
-            return "{}"
-        inner = "\n" + "  " * (level + 1)
-        pieces = [inner + json.dumps(str(key), ensure_ascii=False) + ": "
-                  + _encode_compare_json(item, level + 1)
-                  for key, item in value.items()]
-        closer = "\n" + "  " * level
-        return "{" + ",".join(pieces) + closer + "}"
-    raise TypeError(f"cannot serialize {type(value).__name__} in compare output")
+    parts = []
+    # Pending-container frames: [kind, items, level, next_index]; kind 0 is
+    # a list/tuple (items are values) and kind 1 is a dict (items are
+    # (key, value) pairs). The value currently being rendered is ``v``.
+    frames = []
+    v = value
+    while True:
+        if v is None:
+            parts.append("null")
+        elif v is True:
+            parts.append("true")
+        elif v is False:
+            parts.append("false")
+        elif isinstance(v, str):
+            parts.append(json.dumps(v, ensure_ascii=False))
+        elif isinstance(v, Decimal):
+            parts.append(str(v))
+        elif isinstance(v, int):
+            parts.append(str(v))
+        elif isinstance(v, float):
+            parts.append(repr(v))
+        elif isinstance(v, (list, tuple)):
+            if not v:
+                parts.append("[]")
+            else:
+                parts.append("[")
+                frames.append([0, v, len(frames), 0])
+        elif isinstance(v, dict):
+            if not v:
+                parts.append("{}")
+            else:
+                parts.append("{")
+                frames.append([1, list(v.items()), len(frames), 0])
+        else:
+            raise TypeError(f"cannot serialize {type(v).__name__} in compare output")
+        # Descend into the nearest pending child, or close finished frames.
+        while True:
+            if not frames:
+                return "".join(parts)
+            kind, items, frame_level, index = frames[-1]
+            if index < len(items):
+                frames[-1][3] += 1
+                if index:
+                    parts.append(",")
+                parts.append("\n" + "  " * (frame_level + 1))
+                if kind == 1:
+                    key, v = items[index]
+                    parts.append(json.dumps(str(key), ensure_ascii=False) + ": ")
+                else:
+                    v = items[index]
+                break
+            parts.append("\n" + "  " * frame_level + ("]" if kind == 0 else "}"))
+            frames.pop()
 
 
 def _compare_dumps(value):

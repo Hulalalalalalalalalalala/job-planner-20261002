@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 from pathlib import Path
 import subprocess
 import sys
@@ -9,6 +10,15 @@ from job_planner import (compare_reports, execute_job, explain_report, local_pat
                          query_history, run_changes, run_plan, run_retry)
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _reject_json_constant(value):
+    raise ValueError(value)
+
+
+def _loads_strict(text):
+    """Parse CLI output with Decimal floats and no NaN/Infinity tokens."""
+    return json.loads(text, parse_float=Decimal, parse_constant=_reject_json_constant)
 
 
 class JobPlannerTests(unittest.TestCase):
@@ -3105,6 +3115,290 @@ class NonJsonConstantTests(unittest.TestCase):
             with self.subTest(extra=extra):
                 run = subprocess.run(prefix + extra, capture_output=True, text=True)
                 self.assertEqual(run.returncode, 0, run.stderr)
+
+
+class DeepResultTests(unittest.TestCase):
+    """Legal ~600-level nested results never hit the recursion limit."""
+
+    DEPTH = 600
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "notes.txt").write_text("one\ntwo\n", encoding="utf-8")
+        self.jobs = [
+            {"name": "t", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "u", "operation": "sha256", "input": "notes.txt"},
+        ]
+        self.plan = self.root / "plan.json"
+        self.plan.write_text(json.dumps({"jobs": self.jobs}))
+        self.prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                       "--root", str(self.root)]
+
+    def _deep_text(self, leaf, shape="object", name="t"):
+        if shape == "object":
+            inner = '{"a":' * self.DEPTH + leaf + '}' * self.DEPTH
+        elif shape == "array":
+            # The result root object plus DEPTH nested arrays.
+            inner = '{"v":' + '[' * self.DEPTH + leaf + ']' * self.DEPTH + '}'
+        else:
+            pairs = self.DEPTH // 2
+            inner = '{"a":[' * pairs + leaf + ']}' * pairs
+        return ('{"results":[{"name":' + json.dumps(name)
+                + ',"status":"completed","result":' + inner + '}]}')
+
+    def _decorated_text(self, leaf):
+        # DEPTH nested objects, with a sibling string marker at level 251.
+        return ('{"results":[{"name":"t","status":"completed","result":'
+                + '{"a":' * 250 + '{"note":"mid","a":'
+                + '{"a":' * 349 + leaf + '}' * 350 + '}' * 250 + '}]}')
+
+    def _write_raw(self, relative, text):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _follow(value):
+        if isinstance(value, dict):
+            if "a" in value:
+                return value["a"]
+            if "v" in value:
+                return value["v"]
+            return None
+        return value[0]
+
+    def _descend(self, value):
+        depth = 0
+        marker = None
+        while isinstance(value, (dict, list)):
+            if isinstance(value, dict) and "note" in value:
+                marker = value["note"]
+            value = self._follow(value)
+            if value is None:
+                break
+            depth += 1
+        return depth, value, marker
+
+    def test_compare_deep_shapes_unchanged_and_leaf_changed(self):
+        for shape in ("object", "array", "alternating"):
+            with self.subTest(shape=shape):
+                self._write_raw(f"{shape}.json", self._deep_text("1", shape))
+                self._write_raw(f"{shape}-str.json",
+                                self._deep_text('"deep"', shape))
+                same = compare_reports(self.root, self.jobs, "out.json",
+                                       f"{shape}.json", f"{shape}.json")
+                self.assertEqual([row["change"] for row in same["jobs"]],
+                                 ["unchanged"])
+                changed = compare_reports(self.root, self.jobs, "out.json",
+                                          f"{shape}.json", f"{shape}-str.json")
+                row = changed["jobs"][0]
+                self.assertEqual(row["change"], "changed")
+                depth, before_leaf, _ = self._descend(row["before"]["result"])
+                depth_after, after_leaf, _ = self._descend(row["after"]["result"])
+                self.assertEqual(before_leaf, 1)
+                self.assertEqual(after_leaf, "deep")
+                self.assertGreaterEqual(depth, self.DEPTH)
+                self.assertEqual(depth_after, depth)
+
+    def test_compare_deep_exact_number_and_json_semantics(self):
+        pairs = {
+            "int-float": ("1", "1.0", "unchanged"),
+            "int-exp": ("1", "1e0", "unchanged"),
+            "exponents": ("1e400", "10e399", "unchanged"),
+            "neg-zero": ("-0", "0", "unchanged"),
+            "double-noise": ("0.10000000000000001", "0.1", "changed"),
+            "huge": ("1e400", "2e400", "changed"),
+            "tiny": ("1e-400", "0", "changed"),
+            "big-integers": ("9007199254740992", "9007199254740993", "changed"),
+            "bool-number": ("true", "1", "changed"),
+        }
+        for label, (before, after, change) in pairs.items():
+            with self.subTest(label=label):
+                self._write_raw("b.json", self._deep_text(before))
+                self._write_raw("a.json", self._deep_text(after))
+                result = compare_reports(self.root, self.jobs, "out.json",
+                                         "b.json", "a.json")
+                self.assertEqual(result["jobs"][0]["change"], change)
+        # Object key order at the deepest level is irrelevant; array order
+        # stays significant, both 600 containers down.
+        ordered = ('{"z":' + '[' * 599 + '{"p":1,"q":2}' + ']' * 599 + '}')
+        reordered = ('{"z":' + '[' * 599 + '{"q":2,"p":1}' + ']' * 599 + '}')
+        swapped_arrays = ('{"z":' + '[' * 599 + '[1,2]' + ']' * 599 + '}')
+        swapped = ('{"z":' + '[' * 599 + '[2,1]' + ']' * 599 + '}')
+        for label, b, a, change in (("key-order", ordered, reordered, "unchanged"),
+                                    ("array-order", swapped_arrays, swapped, "changed")):
+            with self.subTest(label=label):
+                self._write_raw("b.json",
+                                '{"results":[{"name":"t","status":"completed",'
+                                '"result":' + b + '}]}')
+                self._write_raw("a.json",
+                                '{"results":[{"name":"t","status":"completed",'
+                                '"result":' + a + '}]}')
+                result = compare_reports(self.root, self.jobs, "out.json",
+                                         "b.json", "a.json")
+                self.assertEqual(result["jobs"][0]["change"], change)
+
+    def test_compare_deep_preserves_layers_strings_and_numbers(self):
+        leaf = '{"tip":"h\\u00e9llo \\u6df1","n":0.10000000000000001,' \
+               '"big":1e400,"tiny":1e-400}'
+        self._write_raw("b.json", self._decorated_text(leaf))
+        self._write_raw("a.json", self._decorated_text(leaf))
+        result = compare_reports(self.root, self.jobs, "out.json",
+                                 "b.json", "a.json")
+        self.assertEqual(result["jobs"][0]["change"], "unchanged")
+        for side in ("before", "after"):
+            depth, _, marker = self._descend(result["jobs"][0][side]["result"])
+            self.assertEqual(marker, "mid")
+            self.assertEqual(depth, self.DEPTH)
+        tip = result["jobs"][0]["after"]["result"]
+        for _ in range(self.DEPTH):
+            tip = self._follow(tip)
+        self.assertEqual(tip["tip"], "héllo 深")
+        self.assertIsInstance(tip["n"], Decimal)
+        self.assertEqual(tip["n"], Decimal("0.10000000000000001"))
+        self.assertEqual(tip["big"], Decimal("1e400"))
+        self.assertNotEqual(tip["big"], Decimal("2e400"))
+        self.assertNotEqual(tip["tiny"], 0)
+        self.assertNotIsInstance(tip["big"], float)
+        self.assertNotIsInstance(tip["big"], str)
+
+    def test_history_deep_order_duplicates_missing_and_only(self):
+        self._write_raw("deep.json", self._deep_text("1"))
+        self._write_raw("flat.json",
+                        '{"results":[{"name":"u","status":"completed",'
+                        '"result":{"n":1}}]}')
+        result = query_history(self.root, self.jobs, "out.json",
+                               ["deep.json", "flat.json", "deep.json"])
+        self.assertEqual([row["name"] for row in result["jobs"]], ["t", "u"])
+        t = result["jobs"][0]["history"]
+        u = result["jobs"][1]["history"]
+        self.assertEqual([slot["report"] for slot in t],
+                         ["deep.json", "flat.json", "deep.json"])
+        self.assertIsNone(t[1]["record"])
+        self.assertEqual(t[0], t[2])
+        depth, leaf, _ = self._descend(t[0]["record"]["result"])
+        self.assertEqual(depth, self.DEPTH)
+        self.assertEqual(leaf, 1)
+        self.assertEqual([slot["record"] for slot in u],
+                         [None, {"status": "completed", "result": {"n": 1}}, None])
+        # --only selects exact task names without expanding anything, and a
+        # task no report records keeps an all-null history.
+        only_t = query_history(self.root, self.jobs, "out.json",
+                               ["deep.json", "flat.json"], targets=["t"])
+        self.assertEqual([row["name"] for row in only_t["jobs"]], ["t"])
+        only_u = query_history(self.root, self.jobs, "out.json",
+                               ["deep.json"], targets=["u"])
+        self.assertEqual(only_u["jobs"],
+                         [{"name": "u",
+                           "history": [{"report": "deep.json", "record": None}]}])
+
+    def test_recursion_limit_unchanged_after_deep_queries(self):
+        import sys
+        from job_planner import _compare_dumps
+        before = sys.getrecursionlimit()
+        for shape in ("object", "array", "alternating"):
+            self._write_raw(f"{shape}.json", self._deep_text("1", shape))
+        compare_reports(self.root, self.jobs, "out.json",
+                        "object.json", "array.json")
+        query_history(self.root, self.jobs, "out.json",
+                      ["object.json", "alternating.json", "object.json"])
+        value = Decimal("1")
+        for _ in range(self.DEPTH // 2):
+            value = {"a": [value]}
+        encoded = _compare_dumps({"result": value})
+        self.assertTrue(_loads_strict(encoded)["result"] is not None)
+        self.assertEqual(sys.getrecursionlimit(), before)
+
+    def test_cli_compare_deep_outputs_full_json_exit_0(self):
+        for shape in ("object", "array", "alternating"):
+            with self.subTest(shape=shape):
+                self._write_raw(f"{shape}.json", self._deep_text("1", shape))
+                self._write_raw(f"{shape}-str.json",
+                                self._deep_text('"deep"', shape))
+                run = subprocess.run(
+                    self.prefix + ["--compare", f"{shape}.json", f"{shape}.json"],
+                    capture_output=True, text=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertFalse(run.stderr)
+                self.assertNotIn("Infinity", run.stdout)
+                payload = _loads_strict(run.stdout)
+                self.assertEqual(payload["jobs"][0]["change"], "unchanged")
+                depth, leaf, _ = self._descend(
+                    payload["jobs"][0]["after"]["result"])
+                self.assertGreaterEqual(depth, self.DEPTH)
+                self.assertEqual(leaf, Decimal("1"))
+                run = subprocess.run(
+                    self.prefix + ["--compare", f"{shape}.json", f"{shape}-str.json"],
+                    capture_output=True, text=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                payload = json.loads(run.stdout, parse_float=Decimal)
+                self.assertEqual(payload["jobs"][0]["change"], "changed")
+
+    def test_cli_history_deep_outputs_full_json_exit_0(self):
+        self._write_raw("deep.json", self._deep_text("1"))
+        self._write_raw("flat.json",
+                        '{"results":[{"name":"u","status":"completed",'
+                        '"result":{"n":1}}]}')
+        run = subprocess.run(
+            self.prefix + ["--history", "deep.json", "--history", "flat.json",
+                           "--history", "deep.json"],
+            capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertFalse(run.stderr)
+        self.assertNotIn("Infinity", run.stdout)
+        payload = json.loads(run.stdout, parse_float=Decimal,
+                             parse_constant=lambda c: (_ for _ in ()).throw(
+                                 ValueError(c)))
+        t = next(row for row in payload["jobs"] if row["name"] == "t")
+        self.assertIsNone(t["history"][1]["record"])
+        depth, leaf, _ = self._descend(t["history"][0]["record"]["result"])
+        self.assertEqual(depth, self.DEPTH)
+        self.assertEqual(leaf, Decimal("1"))
+        self.assertEqual(t["history"][0], t["history"][2])
+        # --only keeps the filter exact and still exits 0 on an all-null row.
+        run = subprocess.run(
+            self.prefix + ["--history", "deep.json", "--only", "u"],
+            capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout),
+                         {"jobs": [{"name": "u", "history": [
+                             {"report": "deep.json", "record": None}]}]})
+
+    def test_deep_invalid_reports_still_raise_and_exit_2(self):
+        good = self._deep_text("1")
+        self._write_raw("good.json", good)
+        deep_nan = self._deep_text("NaN")
+        truncated = good[:-8]
+        self._write_raw("nan.json", deep_nan)
+        self._write_raw("truncated.json", truncated)
+        path = self.root / "bad-utf8.json"
+        path.write_text(good, encoding="utf-8")
+        with path.open("ab") as handle:
+            handle.write(b"\xff")
+        for bad in ("nan.json", "truncated.json", "bad-utf8.json"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    compare_reports(self.root, self.jobs, "out.json",
+                                    bad, "good.json")
+                with self.assertRaises(ValueError):
+                    query_history(self.root, self.jobs, "out.json", [bad])
+                for extra in (["--compare", bad, "good.json"],
+                              ["--history", bad]):
+                    run = subprocess.run(self.prefix + extra,
+                                         capture_output=True, text=True)
+                    self.assertEqual(run.returncode, 2, run.stderr)
+                    self.assertEqual(set(json.loads(run.stdout)), {"error"})
+                    self.assertFalse(run.stderr)
+        # The words as strings at depth remain legal.
+        self._write_raw("strings.json", self._deep_text('"NaN and Infinity"'))
+        run = subprocess.run(
+            self.prefix + ["--compare", "strings.json", "strings.json"],
+            capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout)["jobs"][0]["change"], "unchanged")
 
 
 if __name__ == "__main__":
