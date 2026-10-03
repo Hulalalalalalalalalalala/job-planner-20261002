@@ -84,6 +84,29 @@ reports, escaping paths or a bad plan exit 2 with an error JSON. Nothing is
 read besides the plan and report and nothing is created or written. Cannot
 combine with --only, --preview, --retry-preview, --retry or --compare.
 
+History retry preview
+python3 job_planner.py samples/plan-dependencies.json --history-retry .results/old.json --history-retry .results/new.json
+Passes the reports oldest to newest; for each task the last report that
+records it decides and a later missing record does not clear earlier
+state. Prints {"targets": [...], "jobs": [...], "sources": [...]}: only
+tasks whose latest record is failed or blocked are targets, in plan order
+(completed latest or never recorded are excluded); jobs cover those
+targets plus every prerequisite, even ones that completed or were never
+recorded (shared once, unrelated branches omitted), with the same fields
+and order as --preview; sources parallels targets one to one, each with
+only name, status, report (path verbatim) and index (zero-based position
+among the repeated options). Nothing is sorted or scanned; a repeated
+path keeps its own position. No targets prints three empty arrays. The
+whole plan and output are validated first, then every report under the
+--history rules (including non-target and overwritten records); bare
+NaN/Infinity/-Infinity anywhere rejects while legal numbers, including
+exponents beyond float range, are fine. A valid preview exits 0; bad
+reports/paths or a bad plan exit 2 with an error JSON. Nothing besides
+the plan and reports is read and nothing is created or written; a report
+may equal --output. Cannot combine with --only, --record-reasons,
+--preview, --retry-preview, --retry, --compare, --explain, --history,
+--execution, --changed or --run-changed.
+
 Change preview
 python3 job_planner.py samples/plan-dependencies.json --changed samples/notes.txt
 Prints {"targets": [...], "jobs": [...]} for the tasks whose resolved input
