@@ -2894,5 +2894,218 @@ class QueryExecutionTests(unittest.TestCase):
                 self.assertEqual(set(json.loads(run.stdout)), {"error"})
 
 
+class NonJsonConstantTests(unittest.TestCase):
+    """Bare NaN/Infinity/-Infinity tokens are invalid JSON for every reader."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "notes.txt").write_text("one\ntwo\n", encoding="utf-8")
+
+    def _write(self, relative, raw):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+        return path
+
+    def _jobs(self):
+        return [
+            {"name": "a", "operation": "count-lines", "input": "notes.txt"},
+            {"name": "b", "operation": "sha256", "input": "notes.txt",
+             "depends_on": ["a"]},
+        ]
+
+    # Every syntactic position rejects; bytes carry the bare constants.
+    def _constant_reports(self):
+        return {
+            "nested-result": b'{"results":[{"name":"a","status":"completed",'
+                            b'"result":{"x":[1,{"y":NaN}]}}]}',
+            "entry-extra": b'{"results":[{"name":"a","status":"completed",'
+                           b'"result":{},"junk":Infinity}]}',
+            "toplevel-extra": b'{"results":[],"junk":-Infinity}',
+            "empty-results": b'{"results":[NaN]}',
+            "would-retry": b'{"results":[{"name":"a","status":"failed",'
+                           b'"error":"boom","junk":Infinity}]}',
+        }
+
+    def test_preview_retry_rejects_bare_constants_everywhere(self):
+        jobs = self._jobs()
+        for label, raw in self._constant_reports().items():
+            with self.subTest(label=label):
+                self._write(f"{label}.json", raw)
+                with self.assertRaises(ValueError):
+                    preview_retry(self.root, jobs, "new/out.json", f"{label}.json")
+        # No directory for the output path is created by the failed preview.
+        self.assertFalse((self.root / "new").exists())
+
+    def test_preview_retry_accepts_strings_and_legal_numbers(self):
+        jobs = self._jobs()
+        # The same words as JSON strings stay legal, including error text.
+        self._write("strings.json",
+                    b'{"results":['
+                    b'{"name":"a","status":"completed","result":{"x":"NaN"}},'
+                    b'{"name":"b","status":"failed","error":"got Infinity/-Infinity"}]}')
+        preview = preview_retry(self.root, jobs, "new/out.json", "strings.json")
+        self.assertEqual(preview["targets"], ["b"])
+        # Legal-but-huge numbers keep the retry entry's lenient parsing.
+        self._write("numbers.json",
+                    b'{"results":[{"name":"a","status":"completed",'
+                    b'"result":{"big":1e400,"tiny":1e-400,'
+                    b'"long":0.123456789012345678901234567890123456789,'
+                    b'"int":90071992547409931}}]}')
+        self.assertEqual(preview_retry(self.root, jobs, "new/out.json", "numbers.json"),
+                         {"targets": [], "jobs": []})
+
+    def test_run_retry_rejects_without_running_or_touching_files(self):
+        jobs = self._jobs()
+        marker = self._write("keep.json", b"KEEP-CONTENT")
+        for label, raw in self._constant_reports().items():
+            with self.subTest(label=label):
+                report = self._write(f"{label}.json", raw)
+                with self.assertRaises(ValueError):
+                    run_retry(self.root, jobs, "keep.json", f"{label}.json")
+                # The invalid report itself is untouched and no task ran.
+                self.assertEqual(report.read_bytes(), raw)
+        # report == output: the original invalid content is preserved...
+        same = self._write("same.json", self._constant_reports()["nested-result"])
+        with self.assertRaises(ValueError):
+            run_retry(self.root, jobs, "same.json", "same.json")
+        self.assertEqual(same.read_bytes(), self._constant_reports()["nested-result"])
+        # ...also with record_reasons enabled, which cannot change the failure.
+        with self.assertRaises(ValueError):
+            run_retry(self.root, jobs, "same.json", "same.json", record_reasons=True)
+        self.assertEqual(same.read_bytes(), self._constant_reports()["nested-result"])
+        # Nothing ran, no output directory was made and other files are intact.
+        self.assertFalse((self.root / "new").exists())
+        self.assertEqual(marker.read_bytes(), b"KEEP-CONTENT")
+        # A string-form report still retries normally; the failed record is
+        # the only target and its dependent is not pulled in.
+        self._write("strings.json",
+                    b'{"results":[{"name":"a","status":"failed",'
+                    b'"error":"value NaN"}]}')
+        result = run_retry(self.root, jobs, "out.json", "strings.json")
+        self.assertEqual([row["name"] for row in result], ["a"])
+
+    def test_explain_rejects_bare_constants_but_keeps_string_text(self):
+        jobs = self._jobs()
+        for label, raw in (
+            ("nested.json", b'{"results":[{"name":"a","status":"completed",'
+                            b'"result":{"deep":{"x":NaN}}},{"name":"b",'
+                            b'"status":"blocked","blocked_by":["a"]}]}'),
+            ("entry-extra.json", b'{"results":[{"name":"a","status":"failed",'
+                                 b'"error":"e","junk":Infinity}]}'),
+            ("toplevel.json", b'{"results":[],"junk":-Infinity}'),
+            ("empty.json", b'{"results":[{"junk":NaN}]}'),
+        ):
+            with self.subTest(label=label):
+                self._write(label, raw)
+                with self.assertRaises(ValueError):
+                    explain_report(self.root, jobs, "new/out.json", label)
+        self.assertFalse((self.root / "new").exists())
+        # Words inside the failure string are returned verbatim.
+        self._write("strings.json",
+                    b'{"results":[{"name":"a","status":"failed",'
+                    b'"error":"value was NaN and Infinity too"}]}')
+        explained = explain_report(self.root, jobs, "out.json", "strings.json")
+        self.assertEqual(explained["jobs"][0]["causes"][0]["error"],
+                         "value was NaN and Infinity too")
+        # Strict payloads with legal out-of-range exponents explain fine.
+        self._write("numbers.json",
+                    b'{"results":[{"name":"a","status":"completed",'
+                    b'"result":{"big":1e400,"tiny":1e-400}}]}')
+        self.assertEqual(explain_report(self.root, jobs, "out.json", "numbers.json"),
+                         {"jobs": []})
+
+    def test_query_execution_rejects_constants_even_when_it_would_return_null(self):
+        jobs = self._jobs()
+        valid_all = (
+            b'{"results":[{"name":"a","status":"completed","result":{"lines":2}},'
+            b'{"name":"b","status":"completed","result":{"sha256":"x","bytes":8}}],'
+            b'"execution":{"mode":"all","targets":["a","b"],"jobs":['
+            b'{"name":"a","depends_on":[],"reason":"all","required_by":[]},'
+            b'{"name":"b","depends_on":["a"],"reason":"all","required_by":[]}]}}'
+        )
+        self._write("valid.json", valid_all)
+        self.assertEqual(query_execution(self.root, jobs, "out.json", "valid.json")
+                         ["execution"]["mode"], "all")
+        for label, raw in (
+            ("nested.json", b'{"results":[{"name":"a","status":"completed",'
+                            b'"result":{"x":NaN}}]}'),
+            ("entry-extra.json", b'{"results":[{"name":"a","status":"completed",'
+                                 b'"result":{},"junk":Infinity}]}'),
+            ("toplevel.json", b'{"results":[],"junk":-Infinity}'),
+            ("no-exec.json", b'{"results":[],"junk":NaN}'),
+            ("empty-null.json", b'{"results":[],"execution":null,"junk":Infinity}'),
+            ("exec-extra.json",
+             b'{"results":[{"name":"a","status":"completed","result":{"lines":2}},'
+             b'{"name":"b","status":"completed","result":{"sha256":"x","bytes":8}}],'
+             b'"execution":{"mode":"all","targets":["a","b"],"jobs":['
+             b'{"name":"a","depends_on":[],"reason":"all","required_by":[]},'
+             b'{"name":"b","depends_on":["a"],"reason":"all","required_by":[],'
+             b'"junk":NaN}]}}'),
+        ):
+            with self.subTest(label=label):
+                self._write(label, raw)
+                with self.assertRaises(ValueError):
+                    query_execution(self.root, jobs, "new/out.json", label)
+        self.assertFalse((self.root / "new").exists())
+        # Strings (including failure text) do not trigger the rule.
+        self._write("strings.json",
+                    b'{"results":[{"name":"a","status":"failed","error":"NaN"}]}')
+        self.assertEqual(query_execution(self.root, jobs, "out.json", "strings.json"),
+                         {"execution": None})
+
+    def test_compare_and_history_keep_rejecting_constants(self):
+        jobs = self._jobs()
+        self._write("ok.json", b'{"results":[]}')
+        for label, raw in self._constant_reports().items():
+            report = self._write(f"c-{label}.json", raw)
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    compare_reports(self.root, jobs, "out.json", f"c-{label}.json", "ok.json")
+                with self.assertRaises(ValueError):
+                    query_history(self.root, jobs, "out.json", [f"c-{label}.json"])
+                self.assertEqual(report.read_bytes(), raw)
+
+    def test_cli_four_entries_exit_2_error_only_and_preserve_files(self):
+        jobs = self._jobs()
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"jobs": jobs}))
+        prefix = [sys.executable, str(ROOT / "job_planner.py"), "plan.json",
+                  "--root", str(self.root)]
+        self._write("nan.json",
+                    b'{"results":[{"name":"a","status":"completed",'
+                    b'"result":{"x":NaN}}]}')
+        keep = self._write("keep.json", b"KEEP")
+        cases = [
+            ["--retry-preview", "nan.json"],
+            ["--retry", "nan.json", "--output", "new/out.json"],
+            ["--retry", "nan.json", "--output", "new/out.json", "--record-reasons"],
+            ["--explain", "nan.json", "--output", "new/out.json"],
+            ["--execution", "nan.json", "--output", "new/out.json"],
+        ]
+        for extra in cases:
+            with self.subTest(extra=extra):
+                run = subprocess.run(prefix + extra, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                self.assertEqual(set(json.loads(run.stdout)), {"error"})
+                self.assertIn("not valid JSON", run.stdout)
+        # No run, no created directory, existing file untouched, inputs intact.
+        self.assertFalse((self.root / "new").exists())
+        self.assertEqual(keep.read_bytes(), b"KEEP")
+        # The string form is legal for every entry.
+        self._write("strings.json",
+                    b'{"results":[{"name":"a","status":"completed",'
+                    b'"result":{"x":"NaN"},"note":"Infinity"},'
+                    b'{"name":"b","status":"completed","result":{}}]}')
+        for extra in (["--retry-preview", "strings.json"],
+                      ["--explain", "strings.json"],
+                      ["--execution", "strings.json"]):
+            with self.subTest(extra=extra):
+                run = subprocess.run(prefix + extra, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

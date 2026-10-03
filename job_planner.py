@@ -219,8 +219,10 @@ def _load_report_data(root, report, exact_numbers=False):
 
     With ``exact_numbers`` every JSON number is kept as the ``Decimal`` of
     its literal text so comparisons can use the value the report actually
-    expressed instead of a lossy float, and the non-JSON constants
-    ``NaN``/``Infinity``/``-Infinity`` are rejected anywhere in the file.
+    expressed instead of a lossy float. Either way the non-JSON constants
+    ``NaN``/``Infinity``/``-Infinity`` are rejected anywhere in the file,
+    even inside an otherwise ignored field, while the same words written
+    as JSON strings are untouched.
     """
     path = local_path(root, report)
     try:
@@ -233,9 +235,10 @@ def _load_report_data(root, report, exact_numbers=False):
         raise ValueError(f"report {report!r} is not valid UTF-8") from exc
     try:
         if exact_numbers:
-            data = json.loads(text, parse_float=Decimal, parse_constant=_reject_json_constant)
+            data = json.loads(text, parse_float=Decimal,
+                              parse_constant=_reject_json_constant)
         else:
-            data = json.loads(text)
+            data = json.loads(text, parse_constant=_reject_json_constant)
     except ValueError as exc:
         raise ValueError(f"report {report!r} is not valid JSON") from exc
     if not isinstance(data, dict):
@@ -258,7 +261,10 @@ def _read_retry_report(root, report, names):
     """Read and validate a historical run report; return {name: status}.
 
     Names must match the current plan exactly, with no repeats, and one of
-    the three statuses; other entry fields are ignored. Any violation
+    the three statuses; other entry fields are ignored. A bare
+    ``NaN``/``Infinity``/``-Infinity`` constant anywhere in the file is
+    still invalid JSON, even inside an ignored field or an empty results
+    list; the same words inside strings are accepted. Any violation
     raises ValueError.
     """
     results = _load_report_entries(root, report, names)
@@ -345,8 +351,9 @@ def _read_compare_report(root, report, deps_by_name, exact_numbers=False):
     independently of report record order. Any violation raises ValueError.
 
     Only the compare and history entry points pass ``exact_numbers``:
-    then every JSON number is kept as ``Decimal`` and non-JSON numeric
-    constants are rejected, while explain keeps ordinary float parsing.
+    then every JSON number is kept as ``Decimal``; explain and the other
+    readers keep ordinary float parsing, but all readers reject non-JSON
+    numeric constants.
     """
     results = _load_report_entries(root, report, set(deps_by_name),
                                    exact_numbers=exact_numbers)
@@ -505,10 +512,12 @@ def explain_report(root, jobs, output, report):
 
     The whole plan, every input path, the output path (``report`` may
     equal it) and the report are validated exactly like ``compare_reports``
-    — including its strict payload checks — before any tracing, so a
-    partial report is valid and unrecorded branches are covered by plan
-    validation. Nothing is executed, created or written and task inputs
-    are never read.
+    — including its strict payload checks and the rejection of bare
+    ``NaN``/``Infinity``/``-Infinity`` constants anywhere in the file
+    (the same words inside strings stay valid, including inside the
+    reported error text) — before any tracing, so a partial report is
+    valid and unrecorded branches are covered by plan validation. Nothing
+    is executed, created or written and task inputs are never read.
     """
     deps_by_name, _report_path = _validate_plan(root, jobs, output)
     records = _read_compare_report(root, report, deps_by_name)
@@ -693,7 +702,11 @@ def query_execution(root, jobs, output, report):
     The query reads only the plan and the named report: nothing is
     executed, task inputs are never read, and no directory is created or
     file written. A missing, unreadable, non-UTF-8 or invalid-JSON
-    report, an illegal payload, or an absolute or symlink-escaping path
+    report — including one containing a bare
+    ``NaN``/``Infinity``/``-Infinity`` constant anywhere, even inside
+    ``execution`` or an ignored extra field and even when ``results`` is
+    empty or ``execution`` absent; the same words inside strings are
+    fine — an illegal payload, or an absolute or symlink-escaping path
     raises ValueError.
     """
     deps_by_name, _report_path = _validate_plan(root, jobs, output)
@@ -793,7 +806,12 @@ def preview_retry(root, jobs, output, report):
     same fields as ``preview_plan`` with targets. The report may cover a
     partial run: unrecorded tasks join the preview only when they are
     required prerequisites. Nothing is executed or written and job inputs
-    are never read; only the plan and the named report are read.
+    are never read; only the plan and the named report are read. Like
+    every report reader this rejects the non-JSON constants
+    ``NaN``/``Infinity``/``-Infinity`` anywhere in the file — even in
+    ignored fields and with an empty ``results`` — while the same words
+    inside strings are harmless; syntactically legal numbers such as
+    ``1e400`` keep their existing, lenient parsing here.
     """
     deps_by_name, _report_path = _validate_plan(root, jobs, output)
     statuses = _read_retry_report(root, report, {job["name"] for job in jobs})
@@ -1021,8 +1039,12 @@ def run_retry(root, jobs, output, report, record_reasons=False):
 
     The whole plan (including unselected branches and an empty scope) and
     the output path are validated first; report problems raise ValueError
-    exactly as in ``preview_retry``, and creating the output directory or
-    writing the report may raise OSError after tasks have run.
+    exactly as in ``preview_retry`` — including a bare
+    ``NaN``/``Infinity``/``-Infinity`` constant anywhere in the report,
+    which stops the retry before any task input is read, directory
+    created or file written (the same words inside strings are fine) —
+    and creating the output directory or writing the report may raise
+    OSError after tasks have run.
 
     With ``record_reasons=True`` and at least one retry target, the
     written report additionally carries the top-level ``execution``
